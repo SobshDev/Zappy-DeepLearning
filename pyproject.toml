@@ -1,0 +1,39 @@
+[project]
+name = "zappy-rl"
+version = "0.1.0"
+description = "Deep-RL multi-agent civilisation for the Epitech Zappy game (training in a JAX clone, deploy to the reference server)"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Heavy training stack — install on the Linux RTX 4090 box.
+train = [
+    "jax>=0.4.30",
+    "flax>=0.8",
+    "optax>=0.2",
+    "distrax>=0.1.5",
+    "chex>=0.1.86",
+    "wandb>=0.17",
+    "hydra-core>=1.3",
+]
+# Visualization / video pipeline (CPU only).
+viz = [
+    "pygame>=2.5",
+    "matplotlib>=3.8",
+]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["zappy_rl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

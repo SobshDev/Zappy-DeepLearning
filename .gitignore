@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Unpacked reference binaries (regenerate: tar -xf zappy_ref-v3.0.1.tar -C reference)
+/reference/
+
+# Generated artifacts
+/traces/
+/replays/
+/runs/
+/checkpoints/
+/wandb/
+*.sqlite
+*.mp4
