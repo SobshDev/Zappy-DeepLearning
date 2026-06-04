@@ -16,11 +16,13 @@ Full design + rationale: `~/.claude/plans/i-want-you-to-floofy-hammock.md`.
 | Phase | State |
 |---|---|
 | 0 — Reference ground truth + scaffold | ✅ done & verified live |
-| 1 — JAX env + validation suite | 🚧 geometry oracle + protocol parser done; env step/reset next |
-| 2 — Single-agent foraging MAPPO | ⬜ |
+| 1 — JAX env + validation suite | ✅ JAX `vmap` env done, cross-checked vs oracle (fork/eject deferred to v2) |
+| 2 — Single-agent foraging MAPPO | 🚧 next |
 | 3 — Cooperative ritual + emergent broadcast | ⬜ |
 | 4 — League + telemetry + deploy adapter | ⬜ |
 | 5 — 2-week run orchestration + viz | ⬜ |
+
+**Verified so far:** 39 offline tests (geometry, protocol, all core rules, JAX↔oracle cross-check) + live server agreement on vision (16/16 tiles), broadcast (8/8 directions, 2 orientations), and the L1→L2 incantation (elevation + stone consumption). JAX env throughput: **~135k env-steps/s on Apple-Silicon CPU** (vmap × 2048 worlds) — far higher expected on the 4090.
 
 ## Setup
 
@@ -38,6 +40,9 @@ uv pip install --python .venv numpy pytest    # core dev deps
 
 # capture reference-server golden traces (ground truth for the JAX sim):
 .venv/bin/python tools/capture_golden_traces.py --ai 3 --seconds 8 --out traces/run1.ndjson
+
+# pin vision + broadcast geometry against the live server (must print ALL PASS):
+.venv/bin/python tools/validate_against_server.py
 ```
 
 ## Confirmed reference protocol (v3.0.1, verified live)
@@ -58,10 +63,10 @@ uv pip install --python .venv numpy pytest    # core dev deps
 
 ```
 zappy_rl/
-  env/      constants.py · vision.py · broadcast.py   (NumPy reference oracle)
+  env/      constants.py · vision.py · broadcast.py · reference_env.py (oracle) · zappy_env.py (JAX)
   deploy/   protocol.py                                (wire parsing; only TCP code)
   eval/     scripted_ai.py                             (greedy baseline)
-tools/      capture_golden_traces.py
-tests/      test_vision.py · test_broadcast.py · test_protocol.py
+tools/      capture_golden_traces.py · validate_against_server.py
+tests/      test_vision.py · test_broadcast.py · test_protocol.py · test_reference_env.py
 reference/  unpacked zappy_ref-v3.0.1.tar
 ```

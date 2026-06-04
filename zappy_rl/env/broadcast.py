@@ -7,10 +7,9 @@ When a player broadcasts, every other player receives ``message K, text`` where
 ``G-YEP-400_zappy.pdf`` p.5-6. The world is toroidal, so the *shortest* path is
 chosen.
 
-The exact orientation/handedness here is ``# VERIFY``-pinned by golden traces:
-``tools/fit_broadcast.py`` (Phase 1) drives the reference server with two
-players at many relative positions, reads the emitted ``message K`` / ``pbc``
-events, and asserts this function reproduces them.
+The orientation/handedness is CONFIRMED against reference v3.0.1
+(``tools/validate_against_server.py``): with a receiver facing north, the
+emitter placed at all 8 neighbouring tiles produced exactly K = 1,8,7,6,5,4,3,2.
 """
 
 from __future__ import annotations

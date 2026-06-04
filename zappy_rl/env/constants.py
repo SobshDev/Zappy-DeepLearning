@@ -100,7 +100,9 @@ NORTH, EAST, SOUTH, WEST = 1, 2, 3, 4
 
 # World uses X = column (width), Y = row (height), Y increasing downward.
 # "Forward" = move one tile in the facing direction. Right = forward rotated
-# 90° clockwise (screen coords, y down): (dx,dy) -> (-dy,dx).  # VERIFY signs
+# 90° clockwise (screen coords, y down): (dx,dy) -> (-dy,dx).
+# CONFIRMED against reference v3.0.1 (tools/validate_against_server.py): a
+# level-3 Look while facing South reproduced all 16 tiles in exact order.
 FORWARD_DELTA = {
     NORTH: (0, -1),
     EAST: (1, 0),

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import socket
 import subprocess
 import sys
@@ -29,6 +30,9 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_PLAT = "linux" if platform.system() == "Linux" else "macos"
+DEFAULT_SERVER = f"reference/{_PLAT}/zappy_server"
 
 from zappy_rl.deploy.protocol import LineSocket  # noqa: E402
 from zappy_rl.eval.scripted_ai import ScriptedAI  # noqa: E402
@@ -65,7 +69,7 @@ def record_gui(host: str, port: int, out_path: str, t0: float, stop: threading.E
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--server-bin", default="reference/macos/zappy_server")
+    ap.add_argument("--server-bin", default=DEFAULT_SERVER)
     ap.add_argument("-p", "--port", type=int, default=4242)
     ap.add_argument("-x", "--width", type=int, default=10)
     ap.add_argument("-y", "--height", type=int, default=10)
