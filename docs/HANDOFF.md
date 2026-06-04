@@ -25,16 +25,28 @@ the **reference binaries** (`zappy_ref-v3.0.1.tar`) · target box = **Linux + RT
 |---|---|
 | 0 — Reference ground truth + scaffold | ✅ done & verified live |
 | 1 — JAX env + validation suite | ✅ JAX `vmap` env done, cross-checked vs NumPy oracle |
-| 2 — Single-agent foraging MAPPO | 🚧 **NEXT** |
-| 3 — Cooperative ritual + emergent broadcast | ⬜ |
+| 2 — Single-agent foraging MAPPO | ✅ **GATE PASSED** on the 4090 (see below) |
+| 3 — Cooperative ritual + emergent broadcast | 🚧 **NEXT** |
 | 4 — League + telemetry + deploy adapter | ⬜ |
 | 5 — 2-week run orchestration + viz | ⬜ |
 
-**Verified:** 39 pytest tests pass (geometry, protocol, all core rules,
-JAX↔oracle cross-check). Live reference-server agreement on vision (16/16
-tiles), broadcast (8/8 directions, 2 orientations), and L1→L2 incantation
-(elevation + stone consumption). JAX env throughput ≈135k env-steps/s on
-Apple-Silicon CPU (vmap×2048) — expect far higher on the 4090.
+**Verified:** 47 pytest tests pass (geometry, protocol, all core rules,
+JAX↔oracle cross-check, MAPPO math: GAE vs slow reference, GRU carry resets,
+TBPTT chunk indexing, first-update ratio==1). Live reference-server agreement
+on vision (16/16 tiles), broadcast (8/8 directions, 2 orientations), and
+L1→L2 incantation (elevation + stone consumption). Raw JAX env throughput on
+the 4090: **5.6M env-steps/s** (vmap×8192).
+
+**Phase-2 result (`runs/forage6x6-v1`, 50M env-steps in ~3.5 min):**
+- Training throughput **940k env-steps/s** (gate: ≥100k) at num_envs=2048.
+- Stochastic policy: **512/512 eval episodes survive >2000 ticks** — every
+  episode reaches the 4096-tick training cap (min 4099); at a 16384-tick
+  horizon: mean 8635 / min 6880 ticks, still 100% over the gate.
+- Artifacts: `runs/forage6x6-v1/{params.msgpack,config.json,eval.json}`.
+- Caveats logged in eval.json: the *greedy* (argmax) policy collapses (19%
+  ge-2000) — deploy/eval must **sample**, as in training; survival decays
+  ~8.6k ticks out (recurrent state leaves the ≤4096-tick training
+  distribution — irrelevant for the gate, retrained in Phase 3 anyway).
 
 **Correctness chain that's now locked:** `JAX env (zappy_env.py)` ↔
 `NumPy oracle (reference_env.py)` ↔ `live reference server`, all agreeing.
@@ -50,10 +62,17 @@ zappy_rl/
     broadcast.py     toroidal shortest-path -> 8-sector direction K (oracle)
     reference_env.py NumPy rule ORACLE (readable; has fork+eject)
     zappy_env.py     vectorized JAX env (training); v1 DEFERS fork+eject
+  algo/
+    networks.py      GRU(128) actor (+8-token broadcast head) + SEPARATE
+                     GRU(128) centralized critic; ScannedRNN; flatten_obs
+    mappo.py         recurrent MAPPO: rollout/GAE/TBPTT-16 PPO, autoreset,
+                     potential survival shaping, evaluate(), train() driver
+  train.py           CLI (flags auto-generated from TrainConfig)
   deploy/
     protocol.py      wire parsing + LineSocket (ONLY TCP-touching code)
   eval/
     scripted_ai.py   greedy baseline AI (eval opponent + trace activity)
+runs/                training artifacts (gitignored): params/config/eval per run
 tools/
   capture_golden_traces.py  reference server -> NDJSON GUI event traces
   validate_against_server.py vision/broadcast/incantation pinned live (ALL PASS)
@@ -139,27 +158,31 @@ ais=[ScriptedAI('127.0.0.1',4242,'T1',i) for i in range(4)]; \
 [a.run(time.monotonic()+60) for a in ais]"
 ```
 
-## 6. WHAT TO DO NEXT (Phase 2) — for Claude Code on the box
+## 6. WHAT TO DO NEXT (Phase 3) — cooperative ritual + broadcast
 
-Start Claude Code in the repo and give it this prompt:
+Prompt for the next session:
 
-> Read `docs/HANDOFF.md` and `docs/PLAN.md`. We're on the RTX 4090 box now.
-> Continue with **Phase 2: recurrent MAPPO foraging**. Build `zappy_rl/algo/
-> networks.py` (GRU actor + GRU centralized critic + 8-token broadcast head,
-> separate actor/critic GRUs) and `zappy_rl/algo/mappo.py` (PureJaxRL-style
-> recurrent MAPPO over the vmapped `zappy_env`). Train a single agent to forage
-> on a small map. **Gate:** the agent reliably survives >2000 ticks, training at
-> ≥100k env-steps/s on the GPU. Use Weights & Biases for logging. Keep building
-> verifiably — smoke-test the loop on a tiny config first, then scale.
+> Read `docs/HANDOFF.md` and `docs/PLAN.md`. Continue with **Phase 3:
+> cooperative ritual**. Enable 2 agents on 8×8 with Incantation +
+> co-location + broadcast, simplified L1→L2→L3 ladder. Extend the reward per
+> the plan (co-location potential gated by ritual-possible, incantation
+> attempt, broadcast→coordination). **Gate:** pairs reliably complete an
+> L2→L3 ritual.
 
-Reference implementations to mirror (named in the plan):
-- PureJaxRL recurrent PPO: https://github.com/luchris429/purejaxrl
-- JaxMARL MAPPO: https://github.com/FLAIROX/JaxMARL
-
-Key knobs from the plan: GRU(128), **separate** actor/critic RNNs, TBPTT chunk
-16, ≤4 PPO epochs, 2–4 large minibatches, `num_envs ≈ batch`. The env's action
-space is `zappy_env.N_ENV_ACTIONS` (20); broadcast token is a separate head
-feeding `step`'s `tokens` arg.
+What Phase 3 needs that v1 deferred (see §4 and `zappy_env.py` TODOs):
+- Per-agent **death/done** handling in the trainer: today done is env-level
+  (all-dead) — with 2 agents one can die while the env continues. The GAE
+  mask and GRU reset need per-agent done (plumbing is per-(env,agent) row
+  already; `_step_env`/`Transition.done` need the per-agent flag).
+- **Busy agents**: with >1 agent the event clock means some agents are busy
+  (frozen/cooldown) when others act; their submitted actions are ignored by
+  the env. Consider masking their logp out of the PPO loss (use
+  `info["free"]`) so ignored actions don't get credit.
+- Broadcast currently delivers one emitter/step (lowest index) — fine for 2
+  agents, generalize later.
+- Train commands: `python -m zappy_rl.train --help` (flags auto-generated
+  from `TrainConfig`); start from `runs/forage6x6-v1/params.msgpack` or
+  retrain from scratch (50M steps ≈ 3.5 min at 940k SPS).
 
 ## 7. Pitfalls already discovered (save yourself the debugging)
 
@@ -171,3 +194,17 @@ feeding `step`'s `tokens` arg.
 - Resource order everywhere is `food,linemate,deraumere,sibur,mendiane,phiras,thystame`.
 - JAX env recompiles if map size / agent count / action space change — freeze
   them within a training stage; change only at stage boundaries.
+- **Never scale per-step rewards by the event-clock `dt`**: PPO discounts per
+  env-step, so a dt-scaled bonus pays incantation's 300-tick freeze as a lump
+  at one discount factor — "stand on a linemate and freeze" beat foraging
+  until the alive bonus was made flat-per-step (caught in adversarial review).
+- **Eval/deploy must SAMPLE the policy**, not argmax — the greedy policy
+  collapses (entropy-regularized training, ties break degenerately).
+- Rollout-window episode stats go blind once episodes outlive the window
+  (~7·rollout_steps ticks): a converging policy shows `ep_ticks` pinned at the
+  window and `ge2000 = 0`. Read the live `now>=2k` / `alive_frac` metrics.
+- W&B: the box is **not** logged in — runs use `--wandb offline` (or `auto`,
+  which falls back to offline). `wandb login` then `wandb sync wandb/offline-*`
+  to upload, or export `WANDB_API_KEY`.
+- JAX preallocates 75% of VRAM per process — set
+  `XLA_PYTHON_CLIENT_PREALLOCATE=false` when sharing the GPU between runs.
