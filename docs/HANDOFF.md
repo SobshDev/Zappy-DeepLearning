@@ -26,16 +26,18 @@ the **reference binaries** (`zappy_ref-v3.0.1.tar`) · target box = **Linux + RT
 | 0 — Reference ground truth + scaffold | ✅ done & verified live |
 | 1 — JAX env + validation suite | ✅ JAX `vmap` env done, cross-checked vs NumPy oracle |
 | 2 — Single-agent foraging MAPPO | ✅ **GATE PASSED** on the 4090 (see below) |
-| 3 — Cooperative ritual + emergent broadcast | 🚧 **NEXT** |
-| 4 — League + telemetry + deploy adapter | ⬜ |
+| 3 — Cooperative ritual + emergent broadcast | ✅ **GATE PASSED** (see below) |
+| 4 — League + telemetry + deploy adapter | 🚧 **NEXT** |
 | 5 — 2-week run orchestration + viz | ⬜ |
 
-**Verified:** 47 pytest tests pass (geometry, protocol, all core rules,
+**Verified:** 53 pytest tests pass (geometry, protocol, all core rules,
 JAX↔oracle cross-check, MAPPO math: GAE vs slow reference, GRU carry resets,
-TBPTT chunk indexing, first-update ratio==1). Live reference-server agreement
-on vision (16/16 tiles), broadcast (8/8 directions, 2 orientations), and
-L1→L2 incantation (elevation + stone consumption). Raw JAX env throughput on
-the 4090: **5.6M env-steps/s** (vmap×8192).
+TBPTT chunk indexing, first-update ratio==1 incl. multi-agent; Phase-3: phi
+terms, per-agent alive/free masks, double-initiator + dead-during-freeze
+incantation edges). Live reference-server agreement on vision (16/16 tiles),
+broadcast (8/8 directions, 2 orientations), and L1→L2 incantation (elevation
++ stone consumption). Raw JAX env throughput on the 4090: **5.6M env-steps/s**
+(vmap×8192).
 
 **Phase-2 result (`runs/forage6x6-v1`, 50M env-steps in ~3.5 min):**
 - Training throughput **940k env-steps/s** (gate: ≥100k) at num_envs=2048.
@@ -47,6 +49,23 @@ the 4090: **5.6M env-steps/s** (vmap×8192).
   ge-2000) — deploy/eval must **sample**, as in training; survival decays
   ~8.6k ticks out (recurrent state leaves the ≤4096-tick training
   distribution — irrelevant for the gate, retrained in Phase 3 anyway).
+
+**Phase-3 result (`runs/ritual8x8-v1`, 100M env-steps in ~3.6 min):**
+- 8×8, 2 agents, recurrent MAPPO with per-agent dones + busy-action masking
+  + the plan's potential terms (`phi_stones`, `phi_coloc`×tile-progress,
+  `phi_incant`); token entropy 0.01. **459k env-steps/s** at num_envs=1024.
+- Gate: **reach_l3_rate 1.0 — 512/512 eval episodes complete an L2→L3
+  ritual** (stochastic, 8192-tick horizon), median time-to-L3 **831 ticks**;
+  mean max level **4.0** (pairs chain L3→L4 rituals unprompted). Survival
+  100% ≥2000 ticks. Greedy no longer collapses (98.6% L3) but eval/deploy
+  still SAMPLES by convention.
+- Env fixes shipped with this phase (both oracle-aligned, live-revalidated):
+  stones consumed once per *tile* not per *initiator* (double-initiator
+  dedup), and dead-during-freeze participants no longer level/score.
+- Adversarial review (65 agents): 20 findings → 3 real (all fixed: the two
+  env edges above + warm-start shape check + metric rename), 5 explicit
+  verified-correct notes on shaping/GAE/masking/TBPTT math.
+- Artifacts: `runs/ritual8x8-v1/{params.msgpack,config.json,eval.json}`.
 
 **Correctness chain that's now locked:** `JAX env (zappy_env.py)` ↔
 `NumPy oracle (reference_env.py)` ↔ `live reference server`, all agreeing.
@@ -158,31 +177,31 @@ ais=[ScriptedAI('127.0.0.1',4242,'T1',i) for i in range(4)]; \
 [a.run(time.monotonic()+60) for a in ais]"
 ```
 
-## 6. WHAT TO DO NEXT (Phase 3) — cooperative ritual + broadcast
+## 6. WHAT TO DO NEXT (Phase 4) — league + telemetry + deploy adapter
 
 Prompt for the next session:
 
-> Read `docs/HANDOFF.md` and `docs/PLAN.md`. Continue with **Phase 3:
-> cooperative ritual**. Enable 2 agents on 8×8 with Incantation +
-> co-location + broadcast, simplified L1→L2→L3 ladder. Extend the reward per
-> the plan (co-location potential gated by ritual-possible, incantation
-> attempt, broadcast→coordination). **Gate:** pairs reliably complete an
-> L2→L3 ritual.
+> Read `docs/HANDOFF.md` and `docs/PLAN.md`. Continue with **Phase 4**: build
+> `deploy/zappy_ai_adapter.py` (frozen `runs/ritual8x8-v1` policy over TCP,
+> `Look`+`Inventory` each decision cycle, sampled actions), validate the
+> sim↔server obs contract, then the PFSP league (`algo/league.py`) + replay
+> recorder (`viz/recorder.py`). **Gate:** a frozen policy plays a full game
+> on the reference server with zero protocol errors.
 
-What Phase 3 needs that v1 deferred (see §4 and `zappy_env.py` TODOs):
-- Per-agent **death/done** handling in the trainer: today done is env-level
-  (all-dead) — with 2 agents one can die while the env continues. The GAE
-  mask and GRU reset need per-agent done (plumbing is per-(env,agent) row
-  already; `_step_env`/`Transition.done` need the per-agent flag).
-- **Busy agents**: with >1 agent the event clock means some agents are busy
-  (frozen/cooldown) when others act; their submitted actions are ignored by
-  the env. Consider masking their logp out of the PPO loss (use
-  `info["free"]`) so ignored actions don't get credit.
-- Broadcast currently delivers one emitter/step (lowest index) — fine for 2
-  agents, generalize later.
-- Train commands: `python -m zappy_rl.train --help` (flags auto-generated
-  from `TrainConfig`); start from `runs/forage6x6-v1/params.msgpack` or
-  retrain from scratch (50M steps ≈ 3.5 min at 940k SPS).
+Notes for Phase 4 (from the Phase-3 review + build):
+- Deploy adapter: reuse `deploy/protocol.py` parsing and `networks.flatten_obs`
+  — the flat layout (vision·0.2 ‖ self ‖ msg_dir ‖ msg_tok) IS the contract.
+  Load with `flax.serialization.from_bytes({"actor": template, "critic":
+  None}, raw)`; SAMPLE the policy. The policy never learned `Look`/`Inventory`
+  — the adapter must issue both every decision cycle to refresh obs.
+- `--init-actor runs/ritual8x8-v1/params.msgpack` warm-starts new training
+  runs (actor only; shape-checked, needs same hidden).
+- `evaluate()` uses `n_steps = eval_max_ticks//7 + 64`, which assumes agents
+  stay near 7-tick lockstep — revisit the buffer for 3+ agents whose event
+  clocks desync (review flagged, refuted for ≤2 agents).
+- Broadcast still delivers one emitter/step (lowest index) — generalize
+  before 3+-agent comms stages. Fork/eject still deferred (needed for the
+  6-agent L8 curriculum, not for the Phase-4 gate).
 
 ## 7. Pitfalls already discovered (save yourself the debugging)
 
@@ -203,8 +222,11 @@ What Phase 3 needs that v1 deferred (see §4 and `zappy_env.py` TODOs):
 - Rollout-window episode stats go blind once episodes outlive the window
   (~7·rollout_steps ticks): a converging policy shows `ep_ticks` pinned at the
   window and `ge2000 = 0`. Read the live `now>=2k` / `alive_frac` metrics.
-- W&B: the box is **not** logged in — runs use `--wandb offline` (or `auto`,
-  which falls back to offline). `wandb login` then `wandb sync wandb/offline-*`
-  to upload, or export `WANDB_API_KEY`.
+- W&B: the box IS logged in (`gabriel-brument-epi`, key in `~/.netrc`) —
+  `--wandb auto` resolves to online. Phase-2/3 offline runs were synced with
+  `wandb sync wandb/offline-*`.
+- `lvlups_to_l2/l3` metrics count per-agent level-up EVENTS, not rituals — a
+  completed pair ritual contributes 2 (and 4/6 at higher tiers). The gate
+  readout is eval `reach_l3_rate` (per-env max level), which is unaffected.
 - JAX preallocates 75% of VRAM per process — set
   `XLA_PYTHON_CLIENT_PREALLOCATE=false` when sharing the GPU between runs.

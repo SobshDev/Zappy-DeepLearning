@@ -29,6 +29,24 @@ TINY = M.TrainConfig(
     tbptt_chunk=16, num_minibatches=2, epochs=2,
     eval_envs=8, eval_max_ticks=512, max_episode_ticks=512,
 )
+TINY2 = dataclasses.replace(TINY, n_agents=2, width=8, height=8)
+
+
+def mk_state(cfg, pos, level=None, **kw):
+    """Hand-crafted env state for reward/step unit tests."""
+    A = len(pos)
+    base = Z.State(
+        grid=jnp.zeros((cfg.width, cfg.height, 7), jnp.int32),
+        pos=jnp.asarray(pos, jnp.int32), orient=jnp.ones(A, jnp.int32),
+        level=jnp.asarray(level or [1] * A, jnp.int32),
+        inv=jnp.zeros((A, 7), jnp.int32),
+        life=jnp.full(A, Z.START_LIFE, jnp.int32), alive=jnp.ones(A, bool),
+        busy_until=jnp.zeros(A, jnp.int32), pending=jnp.zeros(A, bool),
+        incant_level=jnp.zeros(A, jnp.int32), initiator=jnp.zeros(A, bool),
+        team=jnp.zeros(A, jnp.int32), now=jnp.int32(0), key=KEY,
+        last_dir=jnp.full(A, -1, jnp.int32), last_tok=jnp.full(A, -1, jnp.int32),
+    )
+    return base._replace(**kw)
 
 
 def test_scanned_rnn_resets_carry():
@@ -57,7 +75,8 @@ def test_gae_matches_slow_reference():
     tc = TINY
 
     traj = M.Transition(
-        done=jnp.asarray(done), action=jnp.zeros((T, B), jnp.int32),
+        done=jnp.asarray(done), alive=jnp.ones((T, B), bool),
+        free=jnp.ones((T, B), bool), action=jnp.zeros((T, B), jnp.int32),
         token=jnp.zeros((T, B), jnp.int32), value=jnp.asarray(val),
         reward=jnp.asarray(rew), logp=jnp.zeros((T, B)),
         obs=jnp.zeros((T, B, 1)), wextra=jnp.zeros((T, B, 1)),
@@ -147,7 +166,108 @@ def test_evaluate_runs_and_counts_ticks():
     actor = RecurrentActor(hidden=tc.hidden)
     h0 = ScannedRNN.initialize_carry(1, tc.hidden)
     params = actor.init(KEY, h0, (jnp.zeros((1, 1, OBS_DIM)), jnp.zeros((1, 1), bool)))
-    ticks = M.evaluate(tc, cfg, params, KEY, greedy=False)
-    t = np.asarray(jax.device_get(ticks))
+    out = jax.device_get(M.evaluate(tc, cfg, params, KEY, greedy=False))
+    t = np.asarray(out.ticks)
     assert t.shape == (tc.eval_envs,)
     assert (t > 0).all() and (t <= tc.eval_max_ticks + 300).all()
+    assert (np.asarray(out.max_level) >= 1).all()
+    assert out.t_l3.shape == (tc.eval_envs,)
+    summary = M.eval_summary(out)
+    assert 0.0 <= summary["reach_l3_rate"] <= 1.0
+
+
+# ------------------------------------------------------- Phase 3: multi-agent
+def test_phi_terms():
+    """Each potential term fires on exactly its trigger; Phi=0 when dead."""
+    tc = TINY2
+    cfg = Z.make_cfg(8, 8, 2)
+
+    base = mk_state(cfg, [[2, 2], [5, 5]])
+    phi = np.asarray(M._phi(tc, base))
+    np.testing.assert_allclose(phi, [tc.phi_life, tc.phi_life], atol=1e-6)
+
+    # held stones toward L1->L2 (1 linemate needed, capped at requirement)
+    s = base._replace(inv=jnp.zeros((2, 7), jnp.int32).at[0, 1].set(2))
+    phi = np.asarray(M._phi(tc, s))
+    np.testing.assert_allclose(phi[0] - tc.phi_life, tc.phi_stones, atol=1e-6)
+
+    # co-location x tile progress: L1 solo on a linemate tile = full term
+    g = jnp.zeros((8, 8, 7), jnp.int32).at[2, 2, 1].set(1)
+    phi = np.asarray(M._phi(tc, base._replace(grid=g)))
+    np.testing.assert_allclose(phi[0] - tc.phi_life, tc.phi_coloc, atol=1e-6)
+    assert abs(phi[1] - tc.phi_life) < 1e-6
+
+    # L2 pair on a fully stocked L2->L3 tile: together = full term,
+    # alone = half (coloc progress 1/2, tile progress 1)
+    g3 = (jnp.zeros((8, 8, 7), jnp.int32)
+          .at[3, 3, 1].set(1).at[3, 3, 2].set(1).at[3, 3, 3].set(1))
+    pair = mk_state(cfg, [[3, 3], [3, 3]], level=[2, 2], grid=g3)
+    phi = np.asarray(M._phi(tc, pair))
+    np.testing.assert_allclose(phi - tc.phi_life, [tc.phi_coloc] * 2, atol=1e-6)
+    solo = mk_state(cfg, [[3, 3], [6, 6]], level=[2, 2], grid=g3)
+    phi = np.asarray(M._phi(tc, solo))
+    np.testing.assert_allclose(phi[0] - tc.phi_life, tc.phi_coloc * 0.5, atol=1e-6)
+
+    # frozen in an incantation attempt: + phi_incant * level
+    s = pair._replace(pending=jnp.array([True, False]))
+    phi = np.asarray(M._phi(tc, s))
+    np.testing.assert_allclose(phi[0] - phi[1], tc.phi_incant * 2, atol=1e-6)
+
+    # dead agent: Phi exactly 0 regardless of everything else
+    s = s._replace(alive=jnp.array([False, True]))
+    assert float(M._phi(tc, s)[0]) == 0.0
+
+
+def test_step_env_per_agent_alive_and_free():
+    tc = TINY2
+    cfg = Z.make_cfg(8, 8, 2)
+    fwd = jnp.array([Z.ENV_FORWARD, Z.ENV_FORWARD])
+    toks = jnp.zeros(2, jnp.int32)
+
+    # one agent starving (life < dt): env continues, row flagged dead
+    s = mk_state(cfg, [[1, 1], [5, 5]], life=jnp.array([Z.START_LIFE, 5], jnp.int32))
+    out = M._step_env(cfg, tc, KEY, s, fwd, toks)
+    _, _, reward, done, _, _, alive, free, _, _ = out
+    assert not bool(done)
+    assert bool(alive[0]) and not bool(alive[1])
+    assert float(reward[1]) < -0.9          # death -1 dominates
+    assert bool(free[0]) and bool(free[1])  # both actions were consumed
+
+    # both starving -> env done -> autoreset (alive reflects the FRESH state)
+    s = mk_state(cfg, [[1, 1], [5, 5]], life=jnp.array([5, 5], jnp.int32))
+    out = M._step_env(cfg, tc, KEY, s, fwd, toks)
+    _, _, _, done, _, _, alive, _, _, _ = out
+    assert bool(done) and bool(alive[0]) and bool(alive[1])
+    assert int(out[0].now) == 0             # spliced reset state
+
+    # busy agent: its submitted action must be ignored and flagged not-free
+    s = mk_state(cfg, [[1, 1], [5, 5]], busy_until=jnp.array([100, 0], jnp.int32))
+    out = M._step_env(cfg, tc, KEY, s, fwd, toks)
+    s3, _, _, _, _, _, _, free, _, _ = out
+    assert not bool(free[0]) and bool(free[1])
+    assert tuple(np.asarray(s3.pos[0])) == (1, 1)   # didn't move
+    assert tuple(np.asarray(s3.pos[1])) != (5, 5)   # moved
+
+
+def test_first_update_ratio_is_one_two_agents():
+    """The ratio==1 invariant must survive the multi-agent plumbing:
+    per-agent dones, alive/free masks, and masked KL."""
+    tc = dataclasses.replace(TINY2, epochs=1, num_minibatches=1,
+                             total_env_steps=8 * 32)
+    init_runner, update_iteration, _, _ = M.make_train(tc)
+    runner = init_runner(KEY)
+    _, metrics = jax.jit(update_iteration)(runner)
+    assert float(metrics["approx_kl"]) < 1e-5
+    assert float(metrics["clip_frac"]) == 0.0
+
+
+def test_update_iteration_trains_two_agents():
+    init_runner, update_iteration, _, _ = M.make_train(TINY2)
+    runner = init_runner(KEY)
+    update_iteration = jax.jit(update_iteration)
+    for _ in range(2):
+        runner, metrics = update_iteration(runner)
+    flat = jax.tree.leaves(jax.tree.map(jnp.mean, metrics))
+    assert all(np.isfinite(jax.device_get(v)) for v in flat), metrics
+    for k in ("lvlups_to_l2", "lvlups_to_l3", "frac_l2", "frac_l3", "free_frac"):
+        assert k in metrics

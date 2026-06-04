@@ -222,13 +222,15 @@ def step(cfg: Cfg, key, s: State, actions, tokens):
     # success level per tile (assume <=1 initiator per tile in v1).
     succ_lvl = jnp.zeros((W, H), jnp.int32).at[s.pos[:, 0], s.pos[:, 1]].max(
         jnp.where(init_ready, s.incant_level, 0))
-    # consume stones once per successful initiator tile.
-    stones = jnp.where(init_ready[:, None], REQ_S[jnp.clip(s.incant_level, 0, C.MAX_LEVEL)], 0)
-    grid = s.grid
-    for j in range(C.N_STONES):
-        grid = grid.at[s.pos[:, 0], s.pos[:, 1], 1 + j].add(-stones[:, j])
-    grid = jnp.maximum(grid, 0)
-    leveled = completed & (succ_lvl[s.pos[:, 0], s.pos[:, 1]] == s.incant_level) & (s.incant_level > 0)
+    # consume stones ONCE per successful tile (keyed by succ_lvl): two agents
+    # initiating on the same tile in the same step is one ritual, not two —
+    # the oracle/server consume per ritual, not per initiator.
+    tile_req = REQ_S[jnp.clip(succ_lvl, 0, C.MAX_LEVEL)]      # [W,H,6]; REQ_S[0]=0
+    grid = jnp.maximum(s.grid.at[:, :, 1:].add(-tile_req), 0)
+    # only ALIVE participants level (oracle: reference_env._incantation) — a
+    # surplus participant that starved during the freeze must not level/score.
+    leveled = (completed & (succ_lvl[s.pos[:, 0], s.pos[:, 1]] == s.incant_level)
+               & (s.incant_level > 0) & s.alive)
     level = s.level + leveled.astype(jnp.int32)
     pending = s.pending & ~completed
     initiator = s.initiator & ~completed

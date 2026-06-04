@@ -136,6 +136,44 @@ def test_incantation_needs_two_players_for_l2_to_l3():
     assert int(s.level[0]) == 3 and int(s.level[1]) == 3
 
 
+def test_incantation_double_initiator_consumes_stones_once():
+    """Two agents starting the SAME ritual in the same step = one ritual:
+    stones must be consumed once per tile, not once per initiator."""
+    cfg = Z.make_cfg(11, 11, 2, no_food=True, no_refill=True)
+    grid = np.zeros((11, 11, 7), np.int32)
+    grid[5, 5, C.LINEMATE] = 2
+    grid[5, 5, C.DERAUMERE] = 2
+    grid[5, 5, C.SIBUR] = 2
+    s = mk_state(cfg, [[5, 5], [5, 5]], [C.NORTH, C.NORTH], level=[2, 2], grid=grid)
+    s, *_ = step1(cfg, s, [Z.ENV_INCANT, Z.ENV_INCANT])
+    assert bool(s.pending[0]) and bool(s.pending[1])
+    s, *_ = step1(cfg, s, [Z.ENV_IDLE, Z.ENV_IDLE])
+    assert int(s.level[0]) == 3 and int(s.level[1]) == 3
+    for res in (C.LINEMATE, C.DERAUMERE, C.SIBUR):
+        assert int(s.grid[5, 5, res]) == 1, f"res {res} double-consumed"
+
+
+def test_dead_during_freeze_participant_does_not_level():
+    """A surplus participant that starves during the 300-tick freeze must not
+    level up or be paid the level-up reward (oracle levels alive players only).
+    The ritual itself still succeeds: 2 alive L2 players remain (req_p=2)."""
+    cfg = Z.make_cfg(11, 11, 3, no_food=False, no_refill=True)
+    grid = np.zeros((11, 11, 7), np.int32)
+    grid[5, 5, C.LINEMATE] = 1
+    grid[5, 5, C.DERAUMERE] = 1
+    grid[5, 5, C.SIBUR] = 1
+    s = mk_state(cfg, [[5, 5]] * 3, [C.NORTH] * 3, level=[2, 2, 2], grid=grid)
+    s = s._replace(life=jnp.array([Z.START_LIFE, Z.START_LIFE, 100], jnp.int32))
+    s, *_ = step1(cfg, s, [Z.ENV_INCANT, Z.ENV_IDLE, Z.ENV_IDLE])
+    assert bool(s.pending.all())            # all 3 co-located L2s get frozen
+    assert not bool(s.alive[2])             # starved during the 300-tick dt
+    s, _, r, d, _ = step1(cfg, s, [Z.ENV_IDLE] * 3)
+    assert int(s.level[0]) == 3 and int(s.level[1]) == 3
+    assert int(s.level[2]) == 2             # dead participant must NOT level
+    assert float(r[2]) <= 0.0               # ...nor be paid for it
+    assert not bool(d)
+
+
 def test_broadcast_direction_in_obs():
     cfg = Z.make_cfg(11, 11, 2, no_food=True, no_refill=True)
     # agent0 emitter north of agent1; agent1 faces north -> hears K=1 (front).
