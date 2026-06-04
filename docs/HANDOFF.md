@@ -27,16 +27,21 @@ the **reference binaries** (`zappy_ref-v3.0.1.tar`) · target box = **Linux + RT
 | 1 — JAX env + validation suite | ✅ JAX `vmap` env done, cross-checked vs NumPy oracle |
 | 2 — Single-agent foraging MAPPO | ✅ **GATE PASSED** on the 4090 (see below) |
 | 3 — Cooperative ritual + emergent broadcast | ✅ **GATE PASSED** (see below) |
-| 4 — League + telemetry + deploy adapter | 🚧 **NEXT** |
-| 5 — 2-week run orchestration + viz | ⬜ |
+| 4 — League + telemetry + deploy adapter | ✅ **GATE PASSED** (see below) |
+| 5 — 2-week run orchestration + viz | 🚧 **NEXT** |
 
-**Verified:** 53 pytest tests pass (geometry, protocol, all core rules,
+**Verified:** 94 pytest tests pass (geometry, protocol, all core rules,
 JAX↔oracle cross-check, MAPPO math: GAE vs slow reference, GRU carry resets,
 TBPTT chunk indexing, first-update ratio==1 incl. multi-agent; Phase-3: phi
 terms, per-agent alive/free masks, double-initiator + dead-during-freeze
-incantation edges). Live reference-server agreement on vision (16/16 tiles),
-broadcast (8/8 directions, 2 orientations), and L1→L2 incantation (elevation
-+ stone consumption). Raw JAX env throughput on the 4090: **5.6M env-steps/s**
+incantation edges; Phase-4: obs-contract bit-exactness incl. float32-ULP
+inventory values, adapter wire routing/late-acks/disconnects, PFSP league
+math + persistence, recorder GUI-event fidelity). Live reference-server
+agreement on vision (16/16 tiles), broadcast (8/8 directions, 2
+orientations), L1→L2 incantation (elevation + stone consumption), and the
+FULL deploy obs contract (`tools/validate_obs_contract.py`: real server
+Look/Inventory/broadcast → `build_obs` == sim `flatten_obs(observe(...))`
+bit-for-bit). Raw JAX env throughput on the 4090: **5.6M env-steps/s**
 (vmap×8192).
 
 **Phase-2 result (`runs/forage6x6-v1`, 50M env-steps in ~3.5 min):**
@@ -67,6 +72,36 @@ broadcast (8/8 directions, 2 orientations), and L1→L2 incantation (elevation
   verified-correct notes on shaping/GAE/masking/TBPTT math.
 - Artifacts: `runs/ritual8x8-v1/{params.msgpack,config.json,eval.json}`.
 
+**Phase-4 result (deploy adapter + league + recorder):**
+- **Gate PASS** (`runs/ritual8x8-v1/deploy_gate.json`): the frozen
+  ritual8x8-v1 policy, run as two real `zappy_ai` TCP clients on the
+  reference server (10×10 — the server rejects maps under 10 — f=100),
+  played full games with **zero protocol errors**. Canonical run: both
+  agents L1→L2 with cooperative rituals, played to natural in-game death
+  (~4.5k ticks); an earlier 185 s run chained **L1→L2→L3→L4** (4/4 rituals
+  server-confirmed, one agent surviving the whole budget, 18.5k ticks,
+  3.8k commands, 0 errors). PASS criteria are strict: zero self-reported
+  protocol errors AND no crash AND no silent disconnect AND GUI-observed
+  levels == self-reported levels (independent desync check).
+- Obs contract pinned twice: unit (`tests/test_deploy_adapter.py`, builder ==
+  `flatten_obs(observe(...))` bit-exact incl. ULP-divergent inventory counts)
+  and live (`tools/validate_obs_contract.py` ALL PASS: vision pattern over the
+  full cone, both players visible, inventory/life mapping, broadcast K + token
+  one-hots vs a mirrored sim state).
+- `algo/league.py`: PFSP opponent pool (50% p(1−p)-prioritized / 35%
+  latest-self / 15% exploiter, Beta(1,1) win-rates, crash-safe atomic+durable
+  persistence, single-writer). `viz/recorder.py`: sim episodes → GUI wire
+  protocol (NDJSON + SQLite (gen,episode,tick,seq)); a frozen-policy replay
+  artifact lives at `runs/ritual8x8-v1/replays/` (rituals render with true
+  ~300-tick freezes).
+- Adversarial review (80 agents): 25 findings → 20 confirmed (2 critical:
+  response-deadline starvation under async floods; silent-disconnect-as-PASS
+  gate blindness — both fixed + regression-tested), 5 refuted. A stricter
+  re-gate then caught a REAL wire quirk live (racing co-located Incantations
+  queue the loser's command across the freeze; its ok/ko lands one expect
+  late) — probed on the real server, handled as counted `late_acks`, and the
+  canonical PASS run exercised that exact path (late_acks=1, 0 errors).
+
 **Correctness chain that's now locked:** `JAX env (zappy_env.py)` ↔
 `NumPy oracle (reference_env.py)` ↔ `live reference server`, all agreeing.
 
@@ -86,17 +121,26 @@ zappy_rl/
                      GRU(128) centralized critic; ScannedRNN; flatten_obs
     mappo.py         recurrent MAPPO: rollout/GAE/TBPTT-16 PPO, autoreset,
                      potential survival shaping, evaluate(), train() driver
+    league.py        PFSP opponent pool (snapshots + win-rates + matchmaking)
   train.py           CLI (flags auto-generated from TrainConfig)
   deploy/
     protocol.py      wire parsing + LineSocket (ONLY TCP-touching code)
+    zappy_ai_adapter.py  frozen policy as a real zappy_ai client: build_obs
+                     (the sim<->server contract), PolicyRunner, TCP loop, CLI
   eval/
     scripted_ai.py   greedy baseline AI (eval opponent + trace activity)
+  viz/
+    recorder.py      sim episodes -> GUI wire protocol (NDJSON + SQLite)
 runs/                training artifacts (gitignored): params/config/eval per run
 tools/
   capture_golden_traces.py  reference server -> NDJSON GUI event traces
   validate_against_server.py vision/broadcast/incantation pinned live (ALL PASS)
+  validate_obs_contract.py   deploy obs contract pinned live (ALL PASS)
+  run_deploy_gate.py         Phase-4 gate: server + 2 adapters + GUI watcher
+  record_replay.py           frozen policy -> GUI-protocol replay artifact
   bench_env.py               JAX env throughput benchmark
-tests/                       39 tests (geometry, protocol, rules, JAX cross-check)
+tests/                       94 tests (geometry, protocol, rules, JAX cross-check,
+                             MAPPO math, deploy contract, league, recorder)
 docs/PLAN.md                 full approved plan
 reference/                   unpacked zappy_ref-v3.0.1.tar (gitignored; regenerate)
 ```
@@ -177,31 +221,39 @@ ais=[ScriptedAI('127.0.0.1',4242,'T1',i) for i in range(4)]; \
 [a.run(time.monotonic()+60) for a in ais]"
 ```
 
-## 6. WHAT TO DO NEXT (Phase 4) — league + telemetry + deploy adapter
+## 6. WHAT TO DO NEXT (Phase 5) — curriculum scale-up + 2-week run + viz
 
 Prompt for the next session:
 
-> Read `docs/HANDOFF.md` and `docs/PLAN.md`. Continue with **Phase 4**: build
-> `deploy/zappy_ai_adapter.py` (frozen `runs/ritual8x8-v1` policy over TCP,
-> `Look`+`Inventory` each decision cycle, sampled actions), validate the
-> sim↔server obs contract, then the PFSP league (`algo/league.py`) + replay
-> recorder (`viz/recorder.py`). **Gate:** a frozen policy plays a full game
-> on the reference server with zero protocol errors.
+> Read `docs/HANDOFF.md` and `docs/PLAN.md`. Continue with **Phase 5**: scale
+> the curriculum past 2 agents (stage 3: 12×12, 3 agents, L2→L4 — generalize
+> env broadcast beyond one emitter/step first, warm-start from
+> `--init-actor runs/ritual8x8-v1/params.msgpack`), wire `algo/league.py`
+> snapshots + W&B `generation` grouping into the train loop, build
+> `viz/replay_to_gui.py` (stream recorder NDJSON into the reference GUI) and
+> the heatmap/timelapse pipeline, then set up `tools/run_2week.sh` +
+> systemd crash-resume. **Gate:** stage-3 squads reliably reach L4, and a
+> recorded replay renders end-to-end in the reference GUI.
 
-Notes for Phase 4 (from the Phase-3 review + build):
-- Deploy adapter: reuse `deploy/protocol.py` parsing and `networks.flatten_obs`
-  — the flat layout (vision·0.2 ‖ self ‖ msg_dir ‖ msg_tok) IS the contract.
-  Load with `flax.serialization.from_bytes({"actor": template, "critic":
-  None}, raw)`; SAMPLE the policy. The policy never learned `Look`/`Inventory`
-  — the adapter must issue both every decision cycle to refresh obs.
-- `--init-actor runs/ritual8x8-v1/params.msgpack` warm-starts new training
-  runs (actor only; shape-checked, needs same hidden).
-- `evaluate()` uses `n_steps = eval_max_ticks//7 + 64`, which assumes agents
-  stay near 7-tick lockstep — revisit the buffer for 3+ agents whose event
-  clocks desync (review flagged, refuted for ≤2 agents).
-- Broadcast still delivers one emitter/step (lowest index) — generalize
-  before 3+-agent comms stages. Fork/eject still deferred (needed for the
-  6-agent L8 curriculum, not for the Phase-4 gate).
+Notes for Phase 5 (from the Phase-4 review + build):
+- Replay consumers: read SQLite `ORDER BY tick, seq` (seq makes within-tick
+  emit order explicit); `pic` is stamped at the freeze-START tick so rituals
+  render their true ~300-tick glow. A ready artifact:
+  `runs/ritual8x8-v1/replays/replay_g0_e0.ndjson`
+  (regenerate via `tools/record_replay.py`).
+- 3+ agents needs env work (deferred v1 limits): broadcast delivers ONE
+  emitter/step (lowest index); take-contention unarbitrated; fork/eject
+  absent (needed for the 6-agent L8 stage). `evaluate()`'s
+  `n_steps = eval_max_ticks//7 + 64` buffer assumes near-lockstep — revisit
+  once event clocks desync at 3+ agents.
+- League integration: `League.add_snapshot(flax.serialization.to_bytes(
+  {"actor": ...}), step)` every ~4h of training; `sample_opponent(rng)` for
+  eval matchups; it's bytes-in/bytes-out, single-writer by design.
+- Deploy survival on the real server is ~2× harsher than sim per decision
+  (Inventory 1 + Look 7 + action 7 ticks/cycle vs 7 in sim) — agents reach
+  L2–L4 and can survive 18k+ ticks, but if real-server survival matters for
+  the showcase, consider a cadence-aware fine-tune (train with a 15-tick
+  per-decision cost) before the final demo.
 
 ## 7. Pitfalls already discovered (save yourself the debugging)
 
@@ -230,3 +282,17 @@ Notes for Phase 4 (from the Phase-3 review + build):
   readout is eval `reach_l3_rate` (per-env max level), which is unaffected.
 - JAX preallocates 75% of VRAM per process — set
   `XLA_PYTHON_CLIENT_PREALLOCATE=false` when sharing the GPU between runs.
+- The reference server rejects maps under **10×10** ("Value must be between
+  10 and 42") — the 8×8-trained policy deploys fine (obs are egocentric,
+  per-tile densities identical), but plan deploy geometry accordingly.
+- The server emits a GUI `pdi` on ANY disconnect, including a clean client
+  close — `pdi` is NOT evidence of in-game death; the in-band `dead` line is.
+- Racing co-located `Incantation`s (the trained pair behavior): the loser's
+  command is QUEUED across the freeze; the server answers the elevation lines
+  first and the queued command's ok/ko arrives one expect-window late. The
+  adapter absorbs these as `late_acks` (not protocol errors); anything
+  parsing AI streams must expect them.
+- When mirroring sim obs outside XLA: jnp's `/10.0` compiles to a
+  multiply-by-reciprocal that rounds one float32 ULP differently from
+  numpy's true divide for counts {9, 13, 18, ...} — use `* np.float32(0.1)`
+  to stay bit-exact (`build_obs` does).

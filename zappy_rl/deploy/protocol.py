@@ -72,7 +72,9 @@ class LineSocket:
     def recv_line(self, timeout: float | None = None) -> str | None:
         """Return the next ``\\n``-terminated line (without the newline).
 
-        Returns ``None`` on timeout/EOF. Lines are stripped of trailing ``\\r``.
+        Returns ``None`` on timeout/EOF/connection-reset — to a line-protocol
+        client an RST is the same fact as EOF ("no more data, link gone") and
+        must not crash a deploy agent mid-game. Trailing ``\\r`` is stripped.
         """
         if timeout is not None:
             self.sock.settimeout(timeout)
@@ -80,6 +82,8 @@ class LineSocket:
             try:
                 chunk = self.sock.recv(4096)
             except socket.timeout:
+                return None
+            except OSError:  # ECONNRESET & friends: abrupt server death
                 return None
             if not chunk:
                 return None
