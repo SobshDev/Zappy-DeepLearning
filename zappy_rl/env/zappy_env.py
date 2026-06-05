@@ -88,8 +88,17 @@ class Cfg(NamedTuple):
     # exempt — an idle decision in deploy *is* just the Look.
     # ``density_scale``: scales every resource spawn/refill target ("train
     # hard, play easy" — e.g. 0.7 makes thystame brutally rare).
+    # ``life_noise``: uniform [0, +ticks) OVERSTATEMENT of the life
+    # OBSERVATION feature only (dynamics untouched), modeling the deploy
+    # adapter's dead-reckoned life belief: syncs anchor life_est to the TOP
+    # of the server's ceil(life/126) band, so the live belief error is
+    # one-sided in [0, +126) — the agent always thinks it has >= its true
+    # life (review-pinned; a symmetric model wastes half its mass teaching
+    # pessimism). Live-gated evidence: the squad starves mid-ritual-chain
+    # because the weakest member overestimates its margin.
     overhead: int = 0
     density_scale: float = 1.0
+    life_noise: float = 0.0
 
 
 class State(NamedTuple):
@@ -120,9 +129,10 @@ class Obs(NamedTuple):
 
 
 def make_cfg(width, height, n_agents, n_teams=1, no_food=False, no_refill=False,
-             overhead=0, density_scale=1.0) -> Cfg:
+             overhead=0, density_scale=1.0, life_noise=0.0) -> Cfg:
     return Cfg(int(width), int(height), int(n_agents), int(n_teams), bool(no_food),
-               bool(no_refill), int(overhead), float(density_scale))
+               bool(no_refill), int(overhead), float(density_scale),
+               float(life_noise))
 
 
 def _target_qty(cfg: Cfg, res: int) -> int:
@@ -174,11 +184,23 @@ def observe(cfg: Cfg, s: State) -> Obs:
     mask = (jnp.arange(MAX_VISION_TILES)[None, :] < (s.level[:, None] + 1) ** 2).astype(jnp.float32)
     vision = vision * mask[..., None]
 
+    life_f = s.life[:, None].astype(jnp.float32)
+    if cfg.life_noise > 0:  # static branch: default compiles to today's exact graph
+        # per-agent, per-tick one-sided OVERSTATEMENT of the life BELIEF
+        # (dynamics untouched) — matches deploy, where life_est anchors to
+        # the top of the ceil-band and drifts in [0, +126). fold_in(now)
+        # gives a fresh stream without consuming s.key, which the dynamics
+        # own (note: s.key re-keys only at respawn boundaries, so the stream
+        # is low-entropy within ~20-tick windows — accepted, inverting
+        # fold_in bit-mixing is beyond the policy class)
+        nk = jax.random.fold_in(s.key, s.now)
+        life_f = life_f + jax.random.uniform(
+            nk, life_f.shape, minval=0.0, maxval=cfg.life_noise)
     self_feat = jnp.concatenate([
         jax.nn.one_hot(s.level - 1, C.MAX_LEVEL),
         (s.inv.astype(jnp.float32) / 10.0),
         jax.nn.one_hot(s.orient - 1, 4),
-        jnp.clip(s.life[:, None].astype(jnp.float32) / START_LIFE, 0, 1),
+        jnp.clip(life_f / START_LIFE, 0, 1),
         (s.now < s.busy_until)[:, None].astype(jnp.float32),
     ], axis=1)
 

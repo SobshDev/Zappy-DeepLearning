@@ -97,9 +97,12 @@ class TrainConfig:
     max_episode_ticks: int = 4096
     # sim-to-real robustness knobs (defaults oracle-exact; see env.Cfg):
     # overhead ≈ deploy perceive prefix in ticks/decision; density_scale < 1
-    # trains under scarcer resources than the reference server spawns.
+    # trains under scarcer resources than the reference server spawns;
+    # life_noise = ±ticks of uniform error on the life obs (deploy
+    # dead-reckoning model — teaches food-margin slack at ritual chains).
     overhead: int = 0
     density_scale: float = 1.0
+    life_noise: float = 0.0
     # scale
     num_envs: int = 1024
     rollout_steps: int = 128
@@ -279,7 +282,8 @@ def compute_gae(tc: TrainConfig, traj: Transition, last_val, last_done):
 def make_train(tc: TrainConfig):
     """Build (init_runner, update_iteration) for the jitted training loop."""
     cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams,
-                     overhead=tc.overhead, density_scale=tc.density_scale)
+                     overhead=tc.overhead, density_scale=tc.density_scale,
+                     life_noise=tc.life_noise)
     B, A, H = tc.num_envs, tc.n_agents, tc.hidden
     BA = B * A
     T = tc.rollout_steps

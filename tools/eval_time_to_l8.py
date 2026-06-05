@@ -101,6 +101,9 @@ def main() -> int:
     ap.add_argument("--overhead", type=int, default=None)
     ap.add_argument("--density-scale", type=float, default=None)
     ap.add_argument("--eval-max-ticks", type=int, default=None)
+    ap.add_argument("--life-noise", type=float, default=None,
+                    help="override life-obs noise (robustness probe; "
+                         "standardized eval stays noiseless)")
     ap.add_argument("--greedy", action="store_true",
                     help="argmax actions instead of sampling")
     args = ap.parse_args()
@@ -120,11 +123,19 @@ def main() -> int:
     if args.eval_max_ticks is not None:
         tc_d["eval_max_ticks"] = args.eval_max_ticks
         suffix += f"@h{args.eval_max_ticks}"
+    # eval is NOISELESS unless explicitly probing: a life_noise-trained run's
+    # config.json must not contaminate the standardized (comparable) numbers
+    if args.life_noise is not None:
+        tc_d["life_noise"] = args.life_noise
+        suffix += f"@ln{args.life_noise:g}"
+    else:
+        tc_d["life_noise"] = 0.0
     if args.greedy:
         suffix += "@greedy"
     tc = TrainConfig(**tc_d)
     cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams,
-                     overhead=tc.overhead, density_scale=tc.density_scale)
+                     overhead=tc.overhead, density_scale=tc.density_scale,
+                     life_noise=tc.life_noise)
 
     # actor template -> load checkpoint (actor leaves only)
     actor = RecurrentActor(hidden=tc.hidden)
