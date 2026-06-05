@@ -7,10 +7,13 @@ and a tightening horizon, then scores every checkpoint under ONE standardized
 condition (overhead=8, density=1.0, horizon=8192 — deploy-realistic cadence)
 with ``tools/eval_time_to_l8.py``, on the WIN metric (all 6 agents at L8 —
 ``t_all6_l8``, not the any-agent proxy). A segment becomes the new BEST iff
-its win rate holds (>= best - 2pp) AND its median t(win) improves by >= 1%. Two
-consecutive non-improvements = the plateau (the theoretical-limit stop), with
-a hard segment cap as backstop. Segments always warm-start from BEST (hill
-climb with restarts), so a bad robustness condition can't drag the line down.
+its ``median_all`` — median time-to-win over ALL eval episodes, failures
+= +inf — improves by >= 1% without the win rate dropping > 2pp (see
+``beats``; the winners-only median is survivorship-biased and incomparable
+across win rates). Three consecutive non-improvements = the plateau (the
+theoretical-limit stop), with a hard segment cap as backstop. Segments
+always warm-start from BEST (hill climb with restarts), so a bad robustness
+condition can't drag the line down.
 
 State lives in ``runs/speedrun/state.json`` (atomic writes); completed
 segments (params.msgpack exists) are skipped on re-run, so the driver — like
@@ -98,7 +101,9 @@ def eval_cmd(run_name: str) -> list[str]:
         "--overhead", str(STD["overhead"]),
         "--density-scale", str(STD["density_scale"]),
         "--eval-max-ticks", str(STD["eval_max_ticks"]),
-        "--eval-envs", "512",
+        # forward-only rollouts, so 4x the training env count fits; at p~0.97
+        # this puts the binomial SE at ~0.4pp (the 2pp rate floor = ~5 SE)
+        "--eval-envs", "2048",
     ]
 
 
@@ -109,36 +114,58 @@ def run(cmd: list[str]) -> int:
 
 
 def standardized_eval(run_name: str) -> dict | None:
-    """Run (or reuse) the standardized eval; return {rate, median} or None.
+    """Run (or reuse) the standardized eval; return scoring stats or None.
 
     Scores the WIN metric — t_all6_l8 (all 6 agents at L8 simultaneously) —
     NOT t_any.L8 (first agent). Hill-climbing on the any-agent proxy could
     reward degenerate single-agent rushes that never win (review-pinned).
+    Pre-upgrade eval files (no ``median_all``) are regenerated in place.
     """
     out = ROOT / "runs" / run_name / STD_JSON
-    if not out.exists():
-        if run(eval_cmd(run_name)) != 0 or not out.exists():
-            return None
-    d = json.loads(out.read_text())
-    win = d["t_all6_l8 (win)"]
-    if win.get("rate", 0.0) == 0.0:
-        return {"rate": 0.0, "median": None}
-    return {"rate": win["rate"], "median": win["median"]}
+    if out.exists():
+        win = json.loads(out.read_text())["t_all6_l8 (win)"]
+        if "median_all" in win:
+            return {"rate": win.get("rate", 0.0),
+                    "median": win.get("median"),
+                    "median_all": win["median_all"]}
+        out.unlink()  # stale schema — regenerate
+    if run(eval_cmd(run_name)) != 0 or not out.exists():
+        return None
+    return standardized_eval(run_name)
 
 
 def beats(cand: dict, best: dict) -> bool:
-    if cand["median"] is None:
-        return False
+    """True iff cand improves on best on the WIN objective.
+
+    Scores ``median_all`` — median time-to-win over ALL eval episodes with
+    failures counted as +inf (finite iff rate > 50%). Unlike the winners-only
+    ``median``, it is survivorship-free, so it compares across different win
+    rates and inherently balances reliability against speed: more failures
+    push the median up, faster wins pull it down (review-pinned: the
+    winners-only comparison scored an 11.9%->92.0% rate jump as "no
+    improvement" and stopped the campaign).
+
+    Rules: a candidate in the minority-win regime (median_all = None) never
+    beats a majority-win incumbent; crossing into the majority-win regime
+    beats any minority-win incumbent; between two majority-win runs a >=1%
+    median_all improvement decides, with a -2pp rate floor so a time gain
+    cannot buy a reliability collapse ("win rate first").
+    """
+    cm, bm = cand.get("median_all"), best.get("median_all")
+    if cm is None:  # cand wins <=50% of episodes
+        return bm is None and cand["rate"] > best["rate"] + 0.02
+    if bm is None:  # cand crosses into the majority-win regime
+        return True
     if cand["rate"] < best["rate"] - 0.02:
         return False
-    return best["median"] is None or cand["median"] < best["median"] * 0.99
+    return cm < bm * 0.99
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--max-segments", type=int, default=30)
     ap.add_argument("--steps", type=int, default=400_000_000)
-    ap.add_argument("--plateau", type=int, default=2,
+    ap.add_argument("--plateau", type=int, default=3,
                     help="stop after N consecutive non-improving segments")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the next 6 planned segment commands and exit")
@@ -205,10 +232,10 @@ def main() -> int:
             state["plateau_streak"] = 0
         else:
             state["plateau_streak"] += 1
-        med = "never" if ev["median"] is None else f"{ev['median']:.0f}"
+        med = "inf" if ev["median_all"] is None else f"{ev['median_all']:.0f}"
         status = ("** NEW BEST **" if improved
                   else f"(plateau streak {state['plateau_streak']})")
-        log(f"DONE {name}: rate {ev['rate']:.3f} median {med} {status}")
+        log(f"DONE {name}: rate {ev['rate']:.3f} median_all {med} {status}")
         state["segments"].append({**plan, "status": "done", "eval": ev})
         save_state(state)
         i += 1
@@ -216,13 +243,13 @@ def main() -> int:
     log("================ SPEEDRUN SUMMARY ================")
     for seg in state["segments"]:
         ev = seg.get("eval") or {}
-        med = ev.get("median")
+        med = ev.get("median_all")
         med = "  -  " if med is None else f"{med:6.0f}"
         mark = "  <-- BEST" if state["best"]["run"] == f"runs/{seg['name']}" else ""
         log(f"  {seg['name']}  ov={seg['overhead']:>2} ds={seg['density_scale']:.2f} "
-            f"h={seg['horizon']}  rate {ev.get('rate', 0.0):.3f}  median {med}{mark}")
+            f"h={seg['horizon']}  rate {ev.get('rate', 0.0):.3f}  median_all {med}{mark}")
     log(f"BEST: {state['best']['run']}  rate {state['best']['rate']:.3f} "
-        f"median {state['best']['median']}")
+        f"median_all {state['best'].get('median_all')}")
     why = ("plateau reached" if state["plateau_streak"] >= args.plateau
            else "segment cap reached")
     log(f"speedrun finished ({why})")

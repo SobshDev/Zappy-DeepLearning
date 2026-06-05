@@ -133,9 +133,14 @@ def main() -> int:
         t = np.asarray(t)
         hit = t >= 0
         if not hit.any():
-            return {"rate": 0.0}
+            return {"rate": 0.0, "median_all": None}
         v = t[hit]
+        # survivorship-free time score: failures count as +inf and the median
+        # runs over ALL episodes (finite iff rate > 50%). Comparable across
+        # runs with different win rates — the conditioned `median` is not.
+        med_all = float(np.median(np.where(hit, t, np.inf)))
         return {"rate": float(hit.mean()), "median": float(np.median(v)),
+                "median_all": med_all if np.isfinite(med_all) else None,
                 "p10": float(np.percentile(v, 10)), "p90": float(np.percentile(v, 90)),
                 "min": int(v.min())}
 
@@ -150,7 +155,10 @@ def main() -> int:
         if s["rate"] == 0.0:
             print(f"  {name:16s} never")
         else:
+            ma = s["median_all"]
+            ma = "  inf" if ma is None else f"{ma:5.0f}"
             print(f"  {name:16s} rate {s['rate']:5.1%}  median {s['median']:6.0f}  "
+                  f"median_all {ma}  "
                   f"p10 {s['p10']:6.0f}  p90 {s['p90']:6.0f}  min {s['min']:5d}")
     # atomic: the speedrun driver trusts this file's existence on resume
     final = run / f"time_to_l8{suffix}.json"
