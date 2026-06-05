@@ -96,9 +96,16 @@ class Cfg(NamedTuple):
     # life (review-pinned; a symmetric model wastes half its mass teaching
     # pessimism). Live-gated evidence: the squad starves mid-ritual-chain
     # because the weakest member overestimates its margin.
+    # ``life_noise_window``: ticks each noise draw is held (1 = fresh per
+    # tick). Deploy's belief error is SMOOTH between Inventory syncs
+    # (re-anchored every ~10 cycles ≈ 128+ ticks) — i.i.d. per-tick jitter
+    # is a temporal-structure mismatch a recurrent policy can exploit
+    # (live-gated evidence: an i.i.d.-noise-trained squad never fires
+    # Incantation on the real server's smooth signal).
     overhead: int = 0
     density_scale: float = 1.0
     life_noise: float = 0.0
+    life_noise_window: int = 1
 
 
 class State(NamedTuple):
@@ -129,10 +136,11 @@ class Obs(NamedTuple):
 
 
 def make_cfg(width, height, n_agents, n_teams=1, no_food=False, no_refill=False,
-             overhead=0, density_scale=1.0, life_noise=0.0) -> Cfg:
+             overhead=0, density_scale=1.0, life_noise=0.0,
+             life_noise_window=1) -> Cfg:
     return Cfg(int(width), int(height), int(n_agents), int(n_teams), bool(no_food),
                bool(no_refill), int(overhead), float(density_scale),
-               float(life_noise))
+               float(life_noise), int(life_noise_window))
 
 
 def _target_qty(cfg: Cfg, res: int) -> int:
@@ -193,7 +201,9 @@ def observe(cfg: Cfg, s: State) -> Obs:
         # own (note: s.key re-keys only at respawn boundaries, so the stream
         # is low-entropy within ~20-tick windows — accepted, inverting
         # fold_in bit-mixing is beyond the policy class)
-        nk = jax.random.fold_in(s.key, s.now)
+        # window > 1 holds each draw for K ticks (piecewise-constant, like
+        # deploy's between-sync drift); window=1 is fresh per tick
+        nk = jax.random.fold_in(s.key, s.now // cfg.life_noise_window)
         life_f = life_f + jax.random.uniform(
             nk, life_f.shape, minval=0.0, maxval=cfg.life_noise)
     self_feat = jnp.concatenate([

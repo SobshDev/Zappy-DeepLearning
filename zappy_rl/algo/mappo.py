@@ -103,6 +103,7 @@ class TrainConfig:
     overhead: int = 0
     density_scale: float = 1.0
     life_noise: float = 0.0
+    life_noise_window: int = 1
     # scale
     num_envs: int = 1024
     rollout_steps: int = 128
@@ -283,7 +284,8 @@ def make_train(tc: TrainConfig):
     """Build (init_runner, update_iteration) for the jitted training loop."""
     cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams,
                      overhead=tc.overhead, density_scale=tc.density_scale,
-                     life_noise=tc.life_noise)
+                     life_noise=tc.life_noise,
+                     life_noise_window=tc.life_noise_window)
     B, A, H = tc.num_envs, tc.n_agents, tc.hidden
     BA = B * A
     T = tc.rollout_steps

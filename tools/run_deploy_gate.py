@@ -131,7 +131,8 @@ class GuiWatcher(threading.Thread):
         elif tok[0] == "pin":
             # pin #n X Y q0..q6 — q0 is food (server truth, not dead-reckoned)
             self.food_timeline.append(
-                {"t_s": t_s, "pid": int(tok[1][1:]), "food": int(tok[4])})
+                {"t_s": t_s, "pid": int(tok[1][1:]), "food": int(tok[4]),
+                 "x": int(tok[2]), "y": int(tok[3])})
         elif tok[0] == "pdi":
             pid = int(tok[1][1:])
             self.pdi_events.append(pid)

@@ -104,6 +104,9 @@ def main() -> int:
     ap.add_argument("--life-noise", type=float, default=None,
                     help="override life-obs noise (robustness probe; "
                          "standardized eval stays noiseless)")
+    ap.add_argument("--life-noise-window", type=int, default=None,
+                    help="hold each noise draw for K ticks (deploy-like "
+                         "smooth drift; default per-tick)")
     ap.add_argument("--greedy", action="store_true",
                     help="argmax actions instead of sampling")
     args = ap.parse_args()
@@ -130,12 +133,18 @@ def main() -> int:
         suffix += f"@ln{args.life_noise:g}"
     else:
         tc_d["life_noise"] = 0.0
+    if args.life_noise_window is not None:
+        tc_d["life_noise_window"] = args.life_noise_window
+        suffix += f"@lw{args.life_noise_window}"
+    else:
+        tc_d["life_noise_window"] = 1
     if args.greedy:
         suffix += "@greedy"
     tc = TrainConfig(**tc_d)
     cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams,
                      overhead=tc.overhead, density_scale=tc.density_scale,
-                     life_noise=tc.life_noise)
+                     life_noise=tc.life_noise,
+                     life_noise_window=tc.life_noise_window)
 
     # actor template -> load checkpoint (actor leaves only)
     actor = RecurrentActor(hidden=tc.hidden)
