@@ -75,6 +75,10 @@ class GuiWatcher(threading.Thread):
         self.t0 = time.monotonic()            # reset when the watcher connects
         self.levels_timeline: list[dict] = []  # {"t_s", "pid", "level"} per climb
         self.pdi_events: list[int] = []       # ANY disconnect fires pdi too
+        self.pdi_timeline: list[dict] = []     # {"t_s", "pid"} per death
+        self.rituals_log: list[dict] = []      # pic/pie events with timestamps
+        self.food_timeline: list[dict] = []    # {"t_s", "pid", "food"} ~2s polls
+        self.pids: set[int] = set()
         self.rituals_started = 0
         self.rituals_ok = 0
         self.broadcasts = 0
@@ -88,7 +92,15 @@ class GuiWatcher(threading.Thread):
             assert gui.recv_line(timeout=5) == "WELCOME"
             gui.send("GRAPHIC")
             self.t0 = time.monotonic()  # clock starts at the GRAPHIC handshake
+            last_pin = 0.0
             while not self.stop_flag.is_set():
+                # ~2s server-truth inventory polls: pin replies carry food,
+                # the decisive stat for mid-freeze starvation diagnosis
+                now = time.monotonic()
+                if now - last_pin >= 2.0 and self.pids:
+                    for pid in sorted(self.pids):
+                        gui.send(f"pin #{pid}")
+                    last_pin = now
                 line = gui.recv_line(timeout=0.5)
                 if line is None:
                     continue
@@ -105,22 +117,38 @@ class GuiWatcher(threading.Thread):
         tok = line.split()
         if not tok:
             return
+        t_s = round(time.monotonic() - self.t0, 2)
         if tok[0] in ("pnw", "plv"):
             pid = int(tok[1][1:])
             lvl = int(tok[5] if tok[0] == "pnw" else tok[2])
+            if tok[0] == "pnw":
+                self.pids.add(pid)
             # timeline check vs .get(pid, 0) so the first pnw (level 1) is
             # recorded too; the `levels` floor of 1 below is unchanged.
             if lvl > self.levels.get(pid, 0):
-                self.levels_timeline.append(
-                    {"t_s": round(time.monotonic() - self.t0, 2),
-                     "pid": pid, "level": lvl})
+                self.levels_timeline.append({"t_s": t_s, "pid": pid, "level": lvl})
             self.levels[pid] = max(self.levels.get(pid, 1), lvl)
+        elif tok[0] == "pin":
+            # pin #n X Y q0..q6 — q0 is food (server truth, not dead-reckoned)
+            self.food_timeline.append(
+                {"t_s": t_s, "pid": int(tok[1][1:]), "food": int(tok[4])})
         elif tok[0] == "pdi":
-            self.pdi_events.append(int(tok[1][1:]))
+            pid = int(tok[1][1:])
+            self.pdi_events.append(pid)
+            self.pdi_timeline.append({"t_s": t_s, "pid": pid})
         elif tok[0] == "pic":
             self.rituals_started += 1
+            # pic X Y L #n... — tile, ritual level, participant pids
+            self.rituals_log.append(
+                {"t_s": t_s, "ev": "start", "x": int(tok[1]), "y": int(tok[2]),
+                 "level": int(tok[3]),
+                 "pids": [int(t[1:]) for t in tok[4:] if t.startswith("#")]})
         elif tok[0] == "pie":
-            self.rituals_ok += int(tok[3] == "1") if len(tok) > 3 else 0
+            ok = int(tok[3] == "1") if len(tok) > 3 else 0
+            self.rituals_ok += ok
+            self.rituals_log.append(
+                {"t_s": t_s, "ev": "end", "x": int(tok[1]), "y": int(tok[2]),
+                 "ok": bool(ok)})
         elif tok[0] == "pbc":
             self.broadcasts += 1
         elif tok[0] == "seg":
@@ -138,6 +166,8 @@ def main():
     ap.add_argument("--team", default="T1")
     ap.add_argument("--freq", type=int, default=100)
     ap.add_argument("--duration", type=float, default=180.0, help="seconds")
+    ap.add_argument("--greedy", action="store_true",
+                    help="agents use argmax actions instead of sampling")
     args = ap.parse_args()
 
     run_dir = Path(args.params).parent
@@ -170,7 +200,8 @@ def main():
                 [sys.executable, "-m", "zappy_rl.deploy.zappy_ai_adapter",
                  "--host", HOST, "--port", str(args.port), "--team", args.team,
                  "--params", args.params, "--seed", str(i),
-                 "--duration", str(args.duration), "--report-json", rep],
+                 "--duration", str(args.duration), "--report-json", rep]
+                + (["--greedy"] if args.greedy else []),
                 stdout=log, stderr=subprocess.STDOUT, env=env,
             )
             procs.append(p)
@@ -242,8 +273,11 @@ def main():
                 # pdi fires on ANY disconnect (incl. our end-of-session close);
                 # in-game death truth is the agents' own "alive" field.
                 "pdi_events": gui.pdi_events,
+                "pdi_timeline": gui.pdi_timeline,
                 "rituals_started": gui.rituals_started,
                 "rituals_succeeded": gui.rituals_ok,
+                "rituals_log": gui.rituals_log,
+                "food_timeline": gui.food_timeline,
                 "broadcasts": gui.broadcasts,
                 "game_end": gui.game_end,
                 "watcher_parse_errors": gui.parse_errors,

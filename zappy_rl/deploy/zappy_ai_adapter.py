@@ -46,8 +46,10 @@ Semantic mappings that are easy to get wrong (each mirrors a sim convention):
 * Heard broadcasts are delivered for exactly one decision (the sim overwrites
   ``last_dir/last_tok`` every step); out-of-vocabulary message text (foreign
   AIs) is dropped entirely — the policy only ever heard tokens 0..7.
-* Actions are SAMPLED, never argmax (HANDOFF pitfall: the greedy policy is
-  degenerate under entropy-regularized training).
+* Actions are SAMPLED by default; ``--greedy`` switches to argmax. The
+  Phase-2 greedy collapse (entropy-regularized ties breaking degenerately)
+  no longer applies: from speedrun-s01 onward, greedy measured ~1% faster
+  median t(win) at equal win rate in the standardized sim eval.
 * **Late acks** (probed live, v3.0.1): when an incantation freezes us while we
   have a command in flight — the trained behavior makes BOTH agents send
   ``Incantation`` near-simultaneously, so the loser's command is queued across
@@ -187,7 +189,8 @@ class PolicyRunner:
     """Frozen recurrent actor: loads the checkpoint, holds the GRU carry,
     SAMPLES one (action, token) per observation."""
 
-    def __init__(self, params_path: str | Path, hidden: int = 128, seed: int = 0):
+    def __init__(self, params_path: str | Path, hidden: int = 128, seed: int = 0,
+                 greedy: bool = False):
         import flax.serialization
         import jax
         import jax.numpy as jnp
@@ -214,8 +217,15 @@ class PolicyRunner:
         self.params = loaded["actor"]
         self.h = h0
         self.key = jax.random.PRNGKey(seed)
+        self.greedy = greedy
         self.first = True  # first obs of the episode resets the GRU carry
         self._apply = jax.jit(actor.apply)
+        # pre-warm the jit BEFORE the TCP connect: compilation takes ~13s on
+        # CPU, and life starts decaying at connect — uncompiled, the squad
+        # joins staggered and the game clock burns ~1300 ticks for nothing
+        jax.block_until_ready(self._apply(
+            self.params, h0,
+            (jnp.zeros((1, 1, OBS_DIM)), jnp.zeros((1, 1), bool))))
 
     def act(self, obs: np.ndarray) -> tuple[int, int]:
         from ..algo.networks import cat_sample
@@ -226,6 +236,8 @@ class PolicyRunner:
         done = jnp.full((1, 1), self.first)
         self.h, la, lt = self._apply(self.params, self.h, (obs_j, done))
         self.first = False
+        if self.greedy:  # measured faster at equal win rate from s01 onward
+            return int(jnp.argmax(la[0])), int(jnp.argmax(lt[0]))
         action = int(cat_sample(k_a, la[0])[0])
         token = int(cat_sample(k_t, lt[0])[0])
         return action, token
@@ -252,6 +264,8 @@ class ZappyAIClient:
         self.connected = True
         self.disconnected = False  # link lost while alive (NOT death/budget)
         self.late_acks = 0  # queued-across-freeze ok/ko absorbed at a perceive
+        self.incant_ok = 0  # rituals we initiated that completed with a level
+        self.incant_ko = 0  # instant kos (requirements unmet) + mid-ritual kos
         self.protocol_errors: list[str] = []
         self.cycles = 0
         self.commands = 0
@@ -463,7 +477,12 @@ class ZappyAIClient:
                 )
                 if done is not None and done.startswith("Current level:"):
                     self._note_level(done)
+                    self.incant_ok += 1
+                else:
+                    self.incant_ko += 1
                 self.force_inv = True  # re-anchor life after the long freeze
+            elif resp == "ko":
+                self.incant_ko += 1
             return
 
         resp = self._cmd(cmd, lambda l: l in _OK_KO)
@@ -509,6 +528,9 @@ class ZappyAIClient:
             "alive": self.alive,
             "disconnected": self.disconnected,
             "late_acks": self.late_acks,
+            "incant_ok": self.incant_ok,
+            "incant_ko": self.incant_ko,
+            "stones": dict(self.stones),
             "inv_syncs": self.inv_syncs,
             "max_drift_ticks": round(self.max_drift_ticks, 1),
             "n_protocol_errors": len(self.protocol_errors),
@@ -529,6 +551,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", default=None,
                     help="run config.json (for hidden); default: alongside --params")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--greedy", action="store_true",
+                    help="argmax actions instead of sampling")
     ap.add_argument("--inv-every", type=int, default=10,
                     help="Inventory re-sync period in cycles (life/stones are "
                          "dead-reckoned in between)")
@@ -547,7 +571,8 @@ def main(argv: list[str] | None = None) -> int:
     if cfg_path.exists():
         hidden = int(json.loads(cfg_path.read_text()).get("hidden", 128))
 
-    policy = PolicyRunner(args.params, hidden=hidden, seed=args.seed)
+    policy = PolicyRunner(args.params, hidden=hidden, seed=args.seed,
+                          greedy=args.greedy)
     client = ZappyAIClient.connect(args.host, args.port, args.team, policy,
                                    inv_every=args.inv_every)
     print(f"[adapter] joined {args.team} (slots={client.slots}, "

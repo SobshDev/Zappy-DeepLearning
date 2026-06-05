@@ -38,7 +38,7 @@ from zappy_rl.algo.networks import (
 LEVELS = list(range(2, 9))  # timed tiers
 
 
-def run_eval(tc: TrainConfig, cfg: Z.Cfg, actor_params, key):
+def run_eval(tc: TrainConfig, cfg: Z.Cfg, actor_params, key, greedy=False):
     B, A, H = tc.eval_envs, cfg.n_agents, tc.hidden
     BA = B * A
     actor = RecurrentActor(hidden=H)
@@ -53,8 +53,12 @@ def run_eval(tc: TrainConfig, cfg: Z.Cfg, actor_params, key):
         env_state, obs_v, done_flag, death_tick, t_any, t_all8, h, key = carry
         key, k_a, k_t, k_s = jax.random.split(key, 4)
         h2, la, lt = actor.apply(actor_params, h, (obs_v[None], no_reset))
-        action = cat_sample(k_a, la[0])
-        token = cat_sample(k_t, lt[0])
+        if greedy:  # static under jit — argmax actions, no exploration noise
+            action = jnp.argmax(la[0], axis=-1).astype(jnp.int32)
+            token = jnp.argmax(lt[0], axis=-1).astype(jnp.int32)
+        else:
+            action = cat_sample(k_a, la[0])
+            token = cat_sample(k_t, lt[0])
         s2, o2, _, done, _ = v_step(
             cfg, jax.random.split(k_s, B), env_state,
             action.reshape(B, A), token.reshape(B, A),
@@ -97,6 +101,8 @@ def main() -> int:
     ap.add_argument("--overhead", type=int, default=None)
     ap.add_argument("--density-scale", type=float, default=None)
     ap.add_argument("--eval-max-ticks", type=int, default=None)
+    ap.add_argument("--greedy", action="store_true",
+                    help="argmax actions instead of sampling")
     args = ap.parse_args()
 
     run = Path(args.run)
@@ -114,6 +120,8 @@ def main() -> int:
     if args.eval_max_ticks is not None:
         tc_d["eval_max_ticks"] = args.eval_max_ticks
         suffix += f"@h{args.eval_max_ticks}"
+    if args.greedy:
+        suffix += "@greedy"
     tc = TrainConfig(**tc_d)
     cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams,
                      overhead=tc.overhead, density_scale=tc.density_scale)
@@ -126,8 +134,8 @@ def main() -> int:
     loaded = flax.serialization.from_bytes(
         {"actor": template, "critic": None}, (run / "params.msgpack").read_bytes())
 
-    t_any, t_all8 = jax.jit(run_eval, static_argnums=(0, 1))(
-        tc, cfg, loaded["actor"], jax.random.PRNGKey(args.seed))
+    t_any, t_all8 = jax.jit(run_eval, static_argnums=(0, 1, 4))(
+        tc, cfg, loaded["actor"], jax.random.PRNGKey(args.seed), args.greedy)
 
     def stats(t):
         t = np.asarray(t)
@@ -144,13 +152,15 @@ def main() -> int:
                 "p10": float(np.percentile(v, 10)), "p90": float(np.percentile(v, 90)),
                 "min": int(v.min())}
 
+    mode = "greedy" if args.greedy else "sampled"
     out = {"run": str(run), "n": tc.eval_envs,
            "horizon_ticks": tc.eval_max_ticks,
            "overhead": tc.overhead, "density_scale": tc.density_scale,
+           "policy": mode,
            "t_any": {f"L{k}": stats(t_any[:, i]) for i, k in enumerate(LEVELS)},
            "t_all6_l8 (win)": stats(t_all8)}
     print(f"{run}  n={tc.eval_envs}  horizon={tc.eval_max_ticks} ticks  "
-          f"overhead={tc.overhead} density={tc.density_scale}  (sampled policy)")
+          f"overhead={tc.overhead} density={tc.density_scale}  ({mode} policy)")
     for name, s in {**out["t_any"], "WIN (all 6 @ L8)": out["t_all6_l8 (win)"]}.items():
         if s["rate"] == 0.0:
             print(f"  {name:16s} never")
