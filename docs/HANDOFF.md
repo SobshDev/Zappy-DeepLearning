@@ -235,6 +235,31 @@ Prompt for the next session:
 > systemd crash-resume. **Gate:** stage-3 squads reliably reach L4, and a
 > recorded replay renders end-to-end in the reference GUI.
 
+**Phase-5 progress (overnight curriculum, 2026-06-05).** `make train`
+(`tools/overnight_train.sh`) ran the warm-start chain
+ritual8x8-v1 → 12×12/3p (800M steps) → 16×16/4p (1.2B) → 20×24/6p (800M ×2)
+in 7h22m on the 4090. Stochastic eval (n=512 each, `runs/<name>/eval.json`):
+
+| checkpoint            | max_level_mean | ceiling | survival |
+|-----------------------|---------------|---------|----------|
+| ritual12x12-3p-n1     | 4.00          | 4 (3 players can't do the 4-player L4→5) | 1.00 |
+| ritual16x16-4p-n1     | 6.00          | 6 (L6→7 needs 6 players)                 | 1.00 |
+| ritual20x24-6p-n1/n2  | 7.93 / 7.94   | **8 = win condition**                    | 1.00 |
+
+Every curriculum stage saturated its elevation ceiling; 6-agent squads
+reach **L8 in ~94% of episodes** (sim). Live deploy gate on the stage-3
+checkpoint (3 adapters, 12×12 reference server): **PASS**, zero protocol
+errors, levels [2,4,4] GUI-cross-checked
+(`runs/ritual12x12-3p-n1/deploy_gate.json`). n2 ≈ n1 → more same-config
+steps are saturated; remaining ~6% L7-capped episodes are likely
+thystame-scarcity, not policy. The single-emitter broadcast limit did NOT
+prevent L8 in sim, but remains a sim↔server fidelity gap at 3+ agents.
+Still open for Phase 5: league/W&B wiring into `train.py`,
+`viz/replay_to_gui.py` + heatmap/timelapse, `tools/run_2week.sh` + systemd
+(`tools/overnight_train.sh` is the working precursor), broadcast
+generalization, and a 6-adapter live gate (server `-c 6`; env fork/eject
+still absent but unneeded when all 6 clients connect directly).
+
 Notes for Phase 5 (from the Phase-4 review + build):
 - Replay consumers: read SQLite `ORDER BY tick, seq` (seq makes within-tick
   emit order explicit); `pic` is stamped at the freeze-START tick so rituals
