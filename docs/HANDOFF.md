@@ -260,6 +260,27 @@ Still open for Phase 5: league/W&B wiring into `train.py`,
 generalization, and a 6-adapter live gate (server `-c 6`; env fork/eject
 still absent but unneeded when all 6 clients connect directly).
 
+**Time-to-L8 (2026-06-05, `tools/eval_time_to_l8.py`).** Sim, 512 sampled
+episodes of ritual20x24-6p-n2: median **L1→L8 in 2,590 ticks** (p10 2548 /
+p90 2646 / min 2499), 94.1% win rate — and t(any L8) ≡ t(all 6 @ L8): the
+final ritual elevates the whole squad at once. Ladder medians: L2@321
+(deterministic opening: ~21 ticks + the 300-tick freeze), L3@1327, L4@1627,
+L5@1920, L6@2199, L7@2255, L8@2590. Theoretical floor ≈ 2100 ticks of
+mandatory freezes (7 tiers × 300) → only ~490 ticks total spent on all
+gathering/movement. The 5.9% misses stall L7→L8 (thystame).
+**Live 6-adapter game** (20×24, 420 s, `runs/ritual20x24-6p-n2/
+deploy_gate.json`): PASS, zero protocol errors, 8/8 rituals (6 solo
+L1→2 + two full-squad group rituals), all six agents reached **L4** —
+but agents 1/2/4 starved at ~cycle 86 (sim-calibrated food margins vs the
+~15-ticks-per-decision live cadence, 2× sim), leaving 3 < 4 players for
+the L4→5 ritual: the squad stalls at L4 live. THE bottleneck for fast
+live L8 is cadence robustness, not protocol or coordination. Levers:
+(a) cadence-aware fine-tune (per-decision overhead / life-drain
+multiplier as a training-only knob, default oracle-exact); (b) slim the
+deploy cycle (drop per-cycle Inventory — food is already dead-reckoned;
+Look every cycle is 7 of the 15 ticks); (c) timestamp `plv` in the gate
+watcher to measure live t_L8.
+
 Notes for Phase 5 (from the Phase-4 review + build):
 - Replay consumers: read SQLite `ORDER BY tick, seq` (seq makes within-tick
   emit order explicit); `pic` is stamped at the freeze-START tick so rituals
