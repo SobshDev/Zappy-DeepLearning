@@ -216,14 +216,15 @@ def main():
         inv0[C.LINEMATE] = 1
         food_stock = inv.get("food", 0)
 
-        def sim_obs(last_dir=-1, last_tok=-1):
+        def sim_obs(last_dir=-1, last_tok=-1, life_ticks=None):
+            life0 = food_stock * C.FOOD_LIFE_TICKS if life_ticks is None else life_ticks
             s = Z.State(
                 grid=jnp.asarray(grid),
                 pos=jnp.asarray([[CX, CY], [ex, ey]], jnp.int32),
                 orient=jnp.asarray([o_r, 1], jnp.int32),
                 level=jnp.asarray([LEVEL, 1], jnp.int32),
                 inv=jnp.asarray([inv0, [0] * 7], jnp.int32),
-                life=jnp.asarray([food_stock * C.FOOD_LIFE_TICKS, Z.START_LIFE], jnp.int32),
+                life=jnp.asarray([life0, Z.START_LIFE], jnp.int32),
                 alive=jnp.ones(2, bool), busy_until=jnp.zeros(2, jnp.int32),
                 pending=jnp.zeros(2, bool), incant_level=jnp.zeros(2, jnp.int32),
                 initiator=jnp.zeros(2, bool), team=jnp.zeros(2, jnp.int32),
@@ -237,6 +238,15 @@ def main():
             "VISION+SELF",
             build_obs(tiles, inv, LEVEL, o_r, food_taken=0),
             sim_obs(),
+        )
+
+        # ----- dead-reckoned life leg (slimmed cycle) -----
+        # 513 is in the 1-ULP-divergent family for /1260 vs the sim's
+        # compiled reciprocal multiply — a sharp pin of build_obs's f32 form.
+        ok_life = compare(
+            "DEAD-RECKONED LIFE",
+            build_obs(tiles, inv, LEVEL, o_r, food_taken=0, life_ticks=513.0),
+            sim_obs(life_ticks=513),
         )
 
         # ----- broadcast leg -----
@@ -264,7 +274,7 @@ def main():
             )
 
         rcv.close(); emt.close(); gui.close()
-        allok = ok_static and ok_k and ok_msg
+        allok = ok_static and ok_life and ok_k and ok_msg
         print("\nSUMMARY:", "ALL PASS" if allok else "FAILURES — see above")
         return 0 if allok else 2
     finally:

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 from pathlib import Path
 
 import flax.serialization
@@ -91,6 +92,11 @@ def main() -> int:
     ap.add_argument("--run", default="runs/ritual20x24-6p-n2")
     ap.add_argument("--eval-envs", type=int, default=512)
     ap.add_argument("--seed", type=int, default=1)
+    # standardized-condition overrides (else: the run's own config.json) —
+    # the speedrun driver compares checkpoints at fixed ov/ds/horizon
+    ap.add_argument("--overhead", type=int, default=None)
+    ap.add_argument("--density-scale", type=float, default=None)
+    ap.add_argument("--eval-max-ticks", type=int, default=None)
     args = ap.parse_args()
 
     run = Path(args.run)
@@ -98,8 +104,19 @@ def main() -> int:
     tc_d = {k: v for k, v in tc_d.items()
             if k in {f.name for f in dataclasses.fields(TrainConfig)}}
     tc_d["eval_envs"] = args.eval_envs
+    suffix = ""
+    if args.overhead is not None:
+        tc_d["overhead"] = args.overhead
+        suffix += f"@ov{args.overhead}"
+    if args.density_scale is not None:
+        tc_d["density_scale"] = args.density_scale
+        suffix += f"@ds{args.density_scale}"
+    if args.eval_max_ticks is not None:
+        tc_d["eval_max_ticks"] = args.eval_max_ticks
+        suffix += f"@h{args.eval_max_ticks}"
     tc = TrainConfig(**tc_d)
-    cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams)
+    cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams,
+                     overhead=tc.overhead, density_scale=tc.density_scale)
 
     # actor template -> load checkpoint (actor leaves only)
     actor = RecurrentActor(hidden=tc.hidden)
@@ -124,16 +141,22 @@ def main() -> int:
 
     out = {"run": str(run), "n": tc.eval_envs,
            "horizon_ticks": tc.eval_max_ticks,
+           "overhead": tc.overhead, "density_scale": tc.density_scale,
            "t_any": {f"L{k}": stats(t_any[:, i]) for i, k in enumerate(LEVELS)},
            "t_all6_l8 (win)": stats(t_all8)}
-    print(f"{run}  n={tc.eval_envs}  horizon={tc.eval_max_ticks} ticks  (sampled policy)")
+    print(f"{run}  n={tc.eval_envs}  horizon={tc.eval_max_ticks} ticks  "
+          f"overhead={tc.overhead} density={tc.density_scale}  (sampled policy)")
     for name, s in {**out["t_any"], "WIN (all 6 @ L8)": out["t_all6_l8 (win)"]}.items():
         if s["rate"] == 0.0:
             print(f"  {name:16s} never")
         else:
             print(f"  {name:16s} rate {s['rate']:5.1%}  median {s['median']:6.0f}  "
                   f"p10 {s['p10']:6.0f}  p90 {s['p90']:6.0f}  min {s['min']:5d}")
-    (run / "time_to_l8.json").write_text(json.dumps(out, indent=2))
+    # atomic: the speedrun driver trusts this file's existence on resume
+    final = run / f"time_to_l8{suffix}.json"
+    tmp = final.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(out, indent=2))
+    os.replace(tmp, final)
     return 0
 
 

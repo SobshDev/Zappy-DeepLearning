@@ -281,6 +281,29 @@ deploy cycle (drop per-cycle Inventory — food is already dead-reckoned;
 Look every cycle is 7 of the 15 ticks); (c) timestamp `plv` in the gate
 watcher to measure live t_L8.
 
+**Speedrun campaign (launched 2026-06-05, `make speedrun`).** Goal: minimize
+time-to-WIN (all 6 agents at L8) under deploy-realistic cadence. Standardized
+baseline of ritual20x24-6p-n2 at `overhead=8`: **win rate 0.119, median 3,491
+ticks** (vs 0.941 / 2,590 at overhead=0 — the quantified sim-to-real gap).
+New machinery, all review-hardened (5 of 12 findings confirmed & fixed, incl.
+a critical: the driver originally hill-climbed the any-agent-L8 proxy instead
+of the all-6 win metric):
+- env knobs `overhead` (per-decision perceive prefix; ENV_IDLE exempt; frozen
+  ritual participants get the same +overhead as the initiator or completions
+  desync) and `density_scale` — defaults oracle-exact, suite + live
+  validators re-passed (106 tests).
+- slimmed adapter cycle: Inventory every `--inv-every` (10) cycles, stones =
+  Take/Set-ok tally (sim inv semantics), life dead-reckoned (charge table,
+  re-anchored at syncs). Live: 2× gate PASS, 0 protocol errors, drift within
+  the healthy ceil-band. Cycle cost 15 → ~14.1 ticks.
+- `tools/speedrun_train.py` (state `runs/speedrun/state.json`, resumable):
+  segments rotate ov {8,10,6,12} × ds {1.0,0.85,0.7}, horizon 8192→6144→4096,
+  always warm-starting from BEST by win-median at the standardized condition
+  (`time_to_l8@ov8@ds1.0@h8192.json`); stops at 2 consecutive
+  non-improvements. `make speedrun-watch/-status/-stop`.
+- gate watcher now timestamps every level-up (`levels_timeline`,
+  `t_first_l8_s/ticks`, `t_all_l8_s/ticks`) — live t(win) is measurable.
+
 Notes for Phase 5 (from the Phase-4 review + build):
 - Replay consumers: read SQLite `ORDER BY tick, seq` (seq makes within-tick
   emit order explicit); `pic` is stamped at the freeze-START tick so rituals
@@ -317,6 +340,15 @@ Notes for Phase 5 (from the Phase-4 review + build):
   until the alive bonus was made flat-per-step (caught in adversarial review).
 - **Eval/deploy must SAMPLE the policy**, not argmax — the greedy policy
   collapses (entropy-regularized training, ties break degenerately).
+- XLA folds float32 division by a constant into multiply-by-reciprocal:
+  `/10.0` (inv) AND `/1260` (life — 162/1261 integer values diverge 1 ULP).
+  Any obs-contract mirror must use `* np.float32(1/c)`, pinned empirically.
+- The server's Inventory food = **ceil(life/126)** — `food*126` is the TOP of
+  the quantization band. Dead-reckoned life legitimately drifts (−126, 0]
+  below it between syncs; only drift outside that band is real desync.
+- Score campaigns on the WIN metric (`t_all6_l8`), never the any-agent-L8
+  proxy — under optimization pressure the proxy can reward single-agent
+  rushes that never win (review-caught before any GPU time was spent).
 - Rollout-window episode stats go blind once episodes outlive the window
   (~7·rollout_steps ticks): a converging policy shows `ep_ticks` pinned at the
   window and `ge2000 = 0`. Read the live `now>=2k` / `alive_frac` metrics.

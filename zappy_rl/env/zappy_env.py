@@ -80,6 +80,16 @@ class Cfg(NamedTuple):
     n_teams: int
     no_food: bool
     no_refill: bool
+    # Training-only robustness knobs — defaults are ORACLE-EXACT (the
+    # cross-check in tests/test_jax_env.py runs with both at their defaults).
+    # ``overhead``: extra ticks added to every real action's cooldown, modeling
+    # the deploy adapter's per-decision perceive prefix (Look ≈ 7 ticks; the
+    # live server charges it on top of each commanded action). ENV_IDLE is
+    # exempt — an idle decision in deploy *is* just the Look.
+    # ``density_scale``: scales every resource spawn/refill target ("train
+    # hard, play easy" — e.g. 0.7 makes thystame brutally rare).
+    overhead: int = 0
+    density_scale: float = 1.0
 
 
 class State(NamedTuple):
@@ -109,12 +119,14 @@ class Obs(NamedTuple):
     msg_tok: jnp.ndarray     # [A,8] float32
 
 
-def make_cfg(width, height, n_agents, n_teams=1, no_food=False, no_refill=False) -> Cfg:
-    return Cfg(int(width), int(height), int(n_agents), int(n_teams), bool(no_food), bool(no_refill))
+def make_cfg(width, height, n_agents, n_teams=1, no_food=False, no_refill=False,
+             overhead=0, density_scale=1.0) -> Cfg:
+    return Cfg(int(width), int(height), int(n_agents), int(n_teams), bool(no_food),
+               bool(no_refill), int(overhead), float(density_scale))
 
 
 def _target_qty(cfg: Cfg, res: int) -> int:
-    return max(1, int(cfg.width * cfg.height * C.DENSITY[res]))
+    return max(1, int(cfg.width * cfg.height * C.DENSITY[res] * cfg.density_scale))
 
 
 def _scatter_grid(cfg: Cfg, key, grid, res: int, n: int):
@@ -287,10 +299,13 @@ def step(cfg: Cfg, key, s: State, actions, tokens):
     incant_level = jnp.where(frozen, level, incant_level)
     pending = pending | frozen
 
-    # cooldowns
-    cost = COST_ENV[act]
+    # cooldowns (+ training-only per-decision overhead; ENV_IDLE is exempt —
+    # see Cfg. Frozen ritual participants get the SAME +overhead as the
+    # initiator's Incantation cost, otherwise they would complete a step
+    # before the initiator and unfreeze without leveling).
+    cost = COST_ENV[act] + cfg.overhead * (act != ENV_IDLE)
     busy = jnp.where(free, now + cost, s.busy_until)
-    busy = jnp.where(frozen, now + C.COST_INCANTATION, busy)
+    busy = jnp.where(frozen, now + C.COST_INCANTATION + cfg.overhead, busy)
 
     # 3) advance the clock to the next free time
     rel = jnp.where(s.alive, busy - now, _BIG)

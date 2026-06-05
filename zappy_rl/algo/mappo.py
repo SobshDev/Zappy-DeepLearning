@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -94,6 +95,11 @@ class TrainConfig:
     n_agents: int = 1
     n_teams: int = 1
     max_episode_ticks: int = 4096
+    # sim-to-real robustness knobs (defaults oracle-exact; see env.Cfg):
+    # overhead ≈ deploy perceive prefix in ticks/decision; density_scale < 1
+    # trains under scarcer resources than the reference server spawns.
+    overhead: int = 0
+    density_scale: float = 1.0
     # scale
     num_envs: int = 1024
     rollout_steps: int = 128
@@ -272,7 +278,8 @@ def compute_gae(tc: TrainConfig, traj: Transition, last_val, last_done):
 # ------------------------------------------------------------------ train
 def make_train(tc: TrainConfig):
     """Build (init_runner, update_iteration) for the jitted training loop."""
-    cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams)
+    cfg = Z.make_cfg(tc.width, tc.height, tc.n_agents, tc.n_teams,
+                     overhead=tc.overhead, density_scale=tc.density_scale)
     B, A, H = tc.num_envs, tc.n_agents, tc.hidden
     BA = B * A
     T = tc.rollout_steps
@@ -597,8 +604,18 @@ def train(tc: TrainConfig, run_name: str = "forage", wandb_mode: str = "disabled
     if wandb_mode != "disabled":
         import wandb as wb  # type: ignore[no-redef]
 
-        wb.init(project="zappy-rl", name=run_name, mode=wandb_mode,
-                config=dataclasses.asdict(tc))
+        try:
+            wb.init(project="zappy-rl", name=run_name, mode=wandb_mode,
+                    config=dataclasses.asdict(tc))
+        except Exception as e:  # network/auth flake must not kill a segment
+            print(f"[train] wandb init ({wandb_mode}) failed: {e!r}; "
+                  f"falling back to offline")
+            try:
+                wb.init(project="zappy-rl", name=run_name, mode="offline",
+                        config=dataclasses.asdict(tc))
+            except Exception:
+                print("[train] offline wandb also failed; logging disabled")
+                wb = None
 
     init_runner, update_iteration, cfg, n_iters = make_train(tc)
     update_iteration = jax.jit(update_iteration)
@@ -650,7 +667,11 @@ def train(tc: TrainConfig, run_name: str = "forage", wandb_mode: str = "disabled
 
     # checkpoint
     params = {"actor": runner["ts_a"].params, "critic": runner["ts_c"].params}
-    (run_dir / "params.msgpack").write_bytes(flax.serialization.to_bytes(params))
+    # atomic: a kill mid-write must not leave a truncated checkpoint that a
+    # skip-if-checkpoint resume (tools/speedrun_train.py) would then trust
+    ckpt_tmp = run_dir / f"params.msgpack.{os.getpid()}.tmp"
+    ckpt_tmp.write_bytes(flax.serialization.to_bytes(params))
+    os.replace(ckpt_tmp, run_dir / "params.msgpack")
 
     # gate eval (stochastic + greedy)
     results = {"train_sps_median": float(np.median(sps_hist)) if sps_hist else 0.0}

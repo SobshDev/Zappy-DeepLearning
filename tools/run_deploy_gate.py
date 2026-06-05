@@ -72,6 +72,8 @@ class GuiWatcher(threading.Thread):
         self.port = port
         self.stop_flag = threading.Event()
         self.levels: dict[int, int] = {}      # pid -> max level seen
+        self.t0 = time.monotonic()            # reset when the watcher connects
+        self.levels_timeline: list[dict] = []  # {"t_s", "pid", "level"} per climb
         self.pdi_events: list[int] = []       # ANY disconnect fires pdi too
         self.rituals_started = 0
         self.rituals_ok = 0
@@ -85,6 +87,7 @@ class GuiWatcher(threading.Thread):
             gui = LineSocket.connect(HOST, self.port)
             assert gui.recv_line(timeout=5) == "WELCOME"
             gui.send("GRAPHIC")
+            self.t0 = time.monotonic()  # clock starts at the GRAPHIC handshake
             while not self.stop_flag.is_set():
                 line = gui.recv_line(timeout=0.5)
                 if line is None:
@@ -105,6 +108,12 @@ class GuiWatcher(threading.Thread):
         if tok[0] in ("pnw", "plv"):
             pid = int(tok[1][1:])
             lvl = int(tok[5] if tok[0] == "pnw" else tok[2])
+            # timeline check vs .get(pid, 0) so the first pnw (level 1) is
+            # recorded too; the `levels` floor of 1 below is unchanged.
+            if lvl > self.levels.get(pid, 0):
+                self.levels_timeline.append(
+                    {"t_s": round(time.monotonic() - self.t0, 2),
+                     "pid": pid, "level": lvl})
             self.levels[pid] = max(self.levels.get(pid, 1), lvl)
         elif tok[0] == "pdi":
             self.pdi_events.append(int(tok[1][1:]))
@@ -202,12 +211,29 @@ def main():
         ok = n_errors == 0 and not crashed and not dropped and levels_match
         fail = (f"FAIL: protocol_errors={n_errors} crashed={crashed} "
                 f"disconnected={dropped} levels_match={levels_match}")
+        # live climb timing from the GUI timeline (same tick basis as
+        # approx_ticks: t_s * freq)
+        to_ticks = lambda t: None if t is None else round(t * args.freq)  # noqa: E731
+        l8_times = [e["t_s"] for e in gui.levels_timeline if e["level"] >= 8]
+        t_first_l8 = min(l8_times) if l8_times else None
+        pid_l8 = {}  # pid -> first t_s at >=8
+        for e in gui.levels_timeline:
+            if e["level"] >= 8 and e["pid"] not in pid_l8:
+                pid_l8[e["pid"]] = e["t_s"]
+        all_pids = {e["pid"] for e in gui.levels_timeline} | set(gui.levels)
+        t_all_l8 = (max(pid_l8.values())
+                    if all_pids and pid_l8.keys() == all_pids else None)
         result = {
             "gate": ("PASS: frozen policy played a full game on the reference "
                      "server with zero protocol errors" if ok else fail),
             "params": args.params,
             "duration_s": round(elapsed, 1),
             "approx_ticks": int(elapsed * args.freq),
+            "levels_timeline": gui.levels_timeline,
+            "t_first_l8_s": t_first_l8,
+            "t_first_l8_ticks": to_ticks(t_first_l8),
+            "t_all_l8_s": t_all_l8,
+            "t_all_l8_ticks": to_ticks(t_all_l8),
             "levels_cross_check": {"gui": gui_levels, "self_reported": self_levels,
                                    "match": levels_match},
             "agents": reports,
@@ -227,6 +253,14 @@ def main():
         out = run_dir / "deploy_gate.json"
         out.write_text(json.dumps(result, indent=2))
         print(json.dumps(result, indent=2))
+        # compact live-climb summary (first agent per tier, tiers >= 5)
+        first_at = {}
+        for e in gui.levels_timeline:
+            first_at.setdefault(e["level"], e["t_s"])
+        climb = "  ".join(f"L{lv}@{first_at[lv]:.0f}s"
+                          for lv in sorted(first_at) if lv >= 5)
+        if climb:
+            print(f"[gate] live climb: {climb} (first agent)")
         print(f"\n[gate] {'PASS' if ok else 'FAIL'} — report at {out}")
         return 0 if ok else 2
     finally:

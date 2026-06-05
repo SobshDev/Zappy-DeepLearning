@@ -10,7 +10,22 @@ The flat input layout is ``networks.flatten_obs`` — vision*0.2 ‖ self ‖ ms
 Decision cycle (the policy never learned ``Look``/``Inventory`` — the sim hands
 it a fresh observation every step, so the adapter must perceive explicitly):
 
-    Inventory -> Look -> build obs -> GRU step -> sampled action -> command
+    [Inventory every N cycles] -> Look -> build obs -> GRU step -> sampled
+    action -> command
+
+``Inventory`` is NOT sent every cycle (cadence: the perceive prefix is the
+deploy/sim speed gap, and the live L4 stall traced to it): the inventory obs
+is dead-reckoned and re-synced every ``--inv-every`` cycles (default 10), plus
+after any involuntary freeze:
+
+* stones: a ``Take``/``Set``-ok tally — which is *exactly* the sim's ``inv``
+  bookkeeping, so between syncs this is the contract, not an approximation
+  (a late ack can shift one tally by 1 until the next sync — tolerated);
+* life: ``life_est`` ticks, charged per completed command from the known cost
+  table (Look 7, moves/takes/sets/broadcast 7, Inventory 1, incantation 300 —
+  incl. passive "Elevation underway" freezes), +126 per ``Take food`` ok,
+  re-synced to ``food_stock*126`` at each Inventory; the signed drift is
+  measured at every sync and reported (``max_drift_ticks``).
 
 Semantic mappings that are easy to get wrong (each mirrors a sim convention):
 
@@ -46,8 +61,9 @@ Semantic mappings that are easy to get wrong (each mirrors a sim convention):
   verifies end-to-end that nothing actually desynced.
 
 Known cadence approximation (documented, not a gate concern): one deploy cycle
-costs ~15 ticks (Inventory 1 + Look 7 + action 7) vs the sim's ~7 per decision,
-and the GRU skips the ignored-action steps a sim agent submits while frozen in
+costs ~14 ticks (Look 7 + action 7, Inventory amortized ~0.1) vs the sim's ~7
+per decision — training with ``TrainConfig.overhead ≈ 7`` mirrors exactly this;
+the GRU skips the ignored-action steps a sim agent submits while frozen in
 an incantation (for co-located pair rituals — the trained behavior — the sim
 also takes exactly one step across the freeze, so the carry cadence matches).
 
@@ -72,6 +88,11 @@ from .protocol import LineSocket, parse_broadcast, parse_inventory, parse_look
 
 _RES_INDEX = {name: i for i, name in enumerate(C.RESOURCE_NAMES)}
 _OK_KO = ("ok", "ko")
+START_LIFE_TICKS = C.START_FOOD * C.FOOD_LIFE_TICKS  # 1260
+# per-command tick cost for life dead-reckoning (server charges the time
+# whether the action ok's or ko's; instant-ko Incantation charges nothing)
+_TICK_COST = {"Forward": 7, "Right": 7, "Left": 7, "Look": 7, "Inventory": 1,
+              "Broadcast": 7, "Take": 7, "Set": 7}
 
 
 # ----------------------------------------------------------- obs (contract)
@@ -83,13 +104,18 @@ def build_obs(
     food_taken: int,
     msg: tuple[int, int] | None = None,
     busy: bool = False,
+    life_ticks: float | None = None,
 ) -> np.ndarray:
     """Parsed server state -> the exact ``flatten_obs`` policy input.
 
     ``tiles`` is ``parse_look`` output (look-order word lists), ``inv`` is
-    ``parse_inventory`` output, ``food_taken`` the cumulative successful
-    ``Take food`` count (sim ``inv[food]`` semantics), ``msg`` an optional
-    heard ``(K, token)``. Mirrors ``Z.observe`` + ``networks.flatten_obs``.
+    ``parse_inventory`` output (or the dead-reckoned stone tally in the same
+    dict shape), ``food_taken`` the cumulative successful ``Take food`` count
+    (sim ``inv[food]`` semantics), ``msg`` an optional heard ``(K, token)``.
+    ``life_ticks``, when given, feeds the life feature directly as
+    ``clip(life_ticks/1260, 0, 1)`` (the sim's exact form — finer than the
+    food-stock fallback ``clip(food/10, 0, 1)``, which quantizes to 126-tick
+    units). Mirrors ``Z.observe`` + ``networks.flatten_obs``.
     """
     vision = np.zeros((Z.MAX_VISION_TILES, C.N_RESOURCES + 1), np.float32)
     n_vis = (level + 1) ** 2  # the sim masks tiles beyond the level's cone
@@ -110,10 +136,19 @@ def build_obs(
     # {9, 13, 18, ...} — *0.1 here keeps the contract bit-exact (review-pinned).
     self_feat[C.MAX_LEVEL : C.MAX_LEVEL + C.N_RESOURCES] = inv_vec * np.float32(0.1)
     self_feat[C.MAX_LEVEL + C.N_RESOURCES + (orient - 1)] = 1.0
-    # life feature: server food stock * 126 ticks <-> sim clip(life/1260, 0, 1)
-    self_feat[C.MAX_LEVEL + C.N_RESOURCES + 4] = min(
-        inv.get("food", 0) / float(C.START_FOOD), 1.0
-    )
+    # life feature: dead-reckoned ticks when available, else server food
+    # stock (food*126 ticks <-> sim clip(life/1260, 0, 1))
+    if life_ticks is not None:
+        # f32 multiply by reciprocal, NOT /1260: XLA folds the sim's division
+        # into a reciprocal multiply — true division diverges by 1 ULP for
+        # 162 of the 1261 integer life values (empirically pinned, like *0.1).
+        self_feat[C.MAX_LEVEL + C.N_RESOURCES + 4] = np.clip(
+            np.float32(life_ticks) * np.float32(1.0 / START_LIFE_TICKS), 0.0, 1.0
+        )
+    else:
+        self_feat[C.MAX_LEVEL + C.N_RESOURCES + 4] = min(
+            inv.get("food", 0) / float(C.START_FOOD), 1.0
+        )
     self_feat[C.MAX_LEVEL + C.N_RESOURCES + 5] = 1.0 if busy else 0.0
 
     msg_dir = np.zeros(9, np.float32)
@@ -204,7 +239,8 @@ class ZappyAIClient:
     # f=100) stalling our queued command, plus server scheduling slack.
     RESPONSE_TIMEOUT = 15.0
 
-    def __init__(self, sock: LineSocket, team: str, policy: PolicyRunner):
+    def __init__(self, sock: LineSocket, team: str, policy: PolicyRunner,
+                 inv_every: int = 10):
         self.sock = sock
         self.team = team
         self.policy = policy
@@ -223,10 +259,20 @@ class ZappyAIClient:
         self.msgs_heard = 0
         self.slots = 0
         self.world = (0, 0)
+        # inventory dead-reckoning (see module doc): stones are a Take/Set-ok
+        # tally (= the sim's own inv bookkeeping); life is charged per command
+        # and re-synced to the server's food stock every `inv_every` cycles.
+        self.inv_every = max(1, inv_every)
+        self.stones = {name: 0 for name in C.RESOURCE_NAMES}  # food key unused
+        self.life_est = float(START_LIFE_TICKS)
+        self.force_inv = False   # set after involuntary freezes (drift risk)
+        self.inv_syncs = 0
+        self.max_drift_ticks = 0.0  # max |life_est - food*126| seen at syncs
 
     @classmethod
-    def connect(cls, host: str, port: int, team: str, policy: PolicyRunner) -> "ZappyAIClient":
-        client = cls(LineSocket.connect(host, port), team, policy)
+    def connect(cls, host: str, port: int, team: str, policy: PolicyRunner,
+                inv_every: int = 10) -> "ZappyAIClient":
+        client = cls(LineSocket.connect(host, port), team, policy, inv_every=inv_every)
         client.handshake()
         return client
 
@@ -267,11 +313,34 @@ class ZappyAIClient:
         if line == "Elevation underway":
             # dragged into a co-located ritual as a passive participant; our
             # in-flight command stalls ~300 ticks (covered by the timeout).
+            self._charge(C.COST_INCANTATION)  # the freeze burns life too
+            self.force_inv = True             # attribution is murky: re-sync
             return True
         if line.startswith("Current level:"):
             self._note_level(line)
             return True
         return False
+
+    def _charge(self, ticks: float) -> None:
+        self.life_est -= ticks
+
+    def _sync_inventory(self, inv: dict[str, int]) -> None:
+        """Re-anchor dead-reckoned life + stones to a fresh Inventory."""
+        server_life = inv.get("food", 0) * C.FOOD_LIFE_TICKS
+        # the server reports food = ceil(life/126), so server_life is the TOP
+        # of the 126-tick band: true life is in (server_life-126, server_life]
+        # and an honestly-charged life_est sits in that same band — i.e.
+        # drift in (-126, 0]. Outside it is real desync. The first sync is
+        # excluded: the pre-sync estimate is the connect-time default, and
+        # handshake wall-time legitimately ages it (review-pinned centering).
+        drift = self.life_est - server_life
+        if self.inv_syncs > 0:
+            excess = max(0.0, drift) + max(0.0, -drift - C.FOOD_LIFE_TICKS)
+            self.max_drift_ticks = max(self.max_drift_ticks, excess)
+        self.life_est = float(server_life)
+        for name in C.RESOURCE_NAMES[1:]:  # food: cumulative-takes, never sync
+            self.stones[name] = inv.get(name, 0)
+        self.inv_syncs += 1
 
     def _note_level(self, line: str) -> None:
         try:
@@ -339,18 +408,28 @@ class ZappyAIClient:
     def cycle(self) -> None:
         """One perceive-decide-act cycle."""
         bracketed = lambda l: l.startswith("[") and l.endswith("]")  # noqa: E731
-        inv_line = self._cmd("Inventory", bracketed, late_ack_ok=True)
-        if not (self.alive and self.connected) or inv_line is None:
-            return  # dead/disconnected: don't queue more commands
+        if self.cycles % self.inv_every == 0 or self.force_inv:
+            inv_line = self._cmd("Inventory", bracketed, late_ack_ok=True)
+            if not (self.alive and self.connected) or inv_line is None:
+                return  # dead/disconnected: don't queue more commands
+            # no charge for Inventory's own tick: the sync re-anchors life to
+            # the server's stock AT RESPONSE TIME, which already includes it
+            try:
+                self._sync_inventory(parse_inventory(inv_line))
+            except ValueError as e:
+                self.protocol_errors.append(str(e))
+                return
+            self.force_inv = False
         look_line = self._cmd("Look", bracketed, late_ack_ok=True)
         if not (self.alive and self.connected) or look_line is None:
             return
+        self._charge(_TICK_COST["Look"])
         try:
-            inv = parse_inventory(inv_line)
             tiles = parse_look(look_line)
         except ValueError as e:
             self.protocol_errors.append(str(e))
             return
+        inv = dict(self.stones)  # dead-reckoned stones, sim-inv semantics
         obs_level = self.level
         if len(tiles) != (self.level + 1) ** 2:
             self.protocol_errors.append(
@@ -363,7 +442,8 @@ class ZappyAIClient:
             if root * root == len(tiles) and 1 <= root - 1 <= C.MAX_LEVEL:
                 obs_level = root - 1
 
-        obs = build_obs(tiles, inv, obs_level, self.orient, self.food_taken, self.msg)
+        obs = build_obs(tiles, inv, obs_level, self.orient, self.food_taken,
+                        self.msg, life_ticks=self.life_est)
         self.msg = None  # delivered for exactly one decision, like the sim
         action, token = self.policy.act(obs)
         self.cycles += 1
@@ -375,6 +455,7 @@ class ZappyAIClient:
         if action == Z.ENV_INCANT:
             resp = self._cmd(cmd, lambda l: l == "Elevation underway" or l == "ko")
             if resp == "Elevation underway":
+                self._charge(C.COST_INCANTATION)  # instant ko charges nothing
                 # frozen 300 ticks; completion is "Current level: k" or "ko"
                 done = self._response(
                     lambda l: l.startswith("Current level:") or l == "ko",
@@ -382,12 +463,25 @@ class ZappyAIClient:
                 )
                 if done is not None and done.startswith("Current level:"):
                     self._note_level(done)
+                self.force_inv = True  # re-anchor life after the long freeze
             return
 
         resp = self._cmd(cmd, lambda l: l in _OK_KO)
+        if resp in _OK_KO:  # the server charges the time on ko too
+            self._charge(_TICK_COST.get(cmd.split()[0], 7))
         if resp == "ok":
             if cmd == "Take food":
                 self.food_taken += 1  # sim inv[food] semantics
+                self.life_est += C.FOOD_LIFE_TICKS
+            elif cmd.startswith("Take "):
+                self.stones[cmd.split()[1]] += 1  # sim inv tally
+            elif cmd == "Set food":
+                # sim: inv[food] -= 1 and the dropped ration's life is lost
+                self.food_taken = max(0, self.food_taken - 1)
+                self.life_est -= C.FOOD_LIFE_TICKS
+            elif cmd.startswith("Set "):
+                name = cmd.split()[1]
+                self.stones[name] = max(0, self.stones[name] - 1)
             elif cmd == "Right":
                 self.orient = self.orient % 4 + 1  # sim rotation convention
             elif cmd == "Left":
@@ -415,6 +509,8 @@ class ZappyAIClient:
             "alive": self.alive,
             "disconnected": self.disconnected,
             "late_acks": self.late_acks,
+            "inv_syncs": self.inv_syncs,
+            "max_drift_ticks": round(self.max_drift_ticks, 1),
             "n_protocol_errors": len(self.protocol_errors),
             "protocol_errors": self.protocol_errors[:50],
         }
@@ -433,6 +529,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", default=None,
                     help="run config.json (for hidden); default: alongside --params")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--inv-every", type=int, default=10,
+                    help="Inventory re-sync period in cycles (life/stones are "
+                         "dead-reckoned in between)")
     ap.add_argument("--max-cycles", type=int, default=None)
     ap.add_argument("--duration", type=float, default=None, help="seconds")
     ap.add_argument("--report-json", default=None)
@@ -449,7 +548,8 @@ def main(argv: list[str] | None = None) -> int:
         hidden = int(json.loads(cfg_path.read_text()).get("hidden", 128))
 
     policy = PolicyRunner(args.params, hidden=hidden, seed=args.seed)
-    client = ZappyAIClient.connect(args.host, args.port, args.team, policy)
+    client = ZappyAIClient.connect(args.host, args.port, args.team, policy,
+                                   inv_every=args.inv_every)
     print(f"[adapter] joined {args.team} (slots={client.slots}, "
           f"world={client.world[0]}x{client.world[1]})")
     try:

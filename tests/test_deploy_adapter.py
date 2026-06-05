@@ -104,6 +104,27 @@ def test_build_obs_matches_sim_observe(level, msg):
     assert got.shape == (OBS_DIM,) == want.shape
     np.testing.assert_array_equal(got, want)
 
+    # dead-reckoned path: life fed directly in ticks (slimmed-cycle contract);
+    # the stone slots come from the tally dict in the same shape
+    got_dr = build_obs(tiles, inv_dict, level, o0, food_taken=3, msg=msg,
+                       life_ticks=float(life0))
+    np.testing.assert_array_equal(got_dr, want)
+
+
+def test_build_obs_life_ticks_is_bit_exact_for_all_values():
+    """clip(life/1260) must match the sim for EVERY integer life value —
+    XLA folds the division into a reciprocal multiply (1-ULP trap, same
+    story as the inv *0.1; 162/1261 values diverge under true division)."""
+    cfg = Z.make_cfg(8, 8, 2, no_food=True, no_refill=True)
+    life_idx = 81 * 8 + C.MAX_LEVEL + C.N_RESOURCES + 4
+    for life in (1, 7, 513, 515, 977, 1033, 1119, 1259, 1260):
+        s = mk_state(cfg, [(4, 4), (5, 5)], [C.NORTH, C.NORTH],
+                     life=[life, Z.START_LIFE])
+        want = np.asarray(flatten_obs(Z.observe(cfg, s)))[0][life_idx]
+        tiles = server_tiles_for(cfg, s, 0)
+        got = build_obs(tiles, {}, 1, C.NORTH, 0, life_ticks=float(life))[life_idx]
+        assert got == want, f"life={life}: {got!r} != {want!r}"
+
 
 def test_build_obs_life_clips_at_one():
     obs = build_obs([["player"]], {"food": 25}, 1, C.NORTH, food_taken=0)
@@ -179,14 +200,85 @@ def test_involuntary_elevation_updates_level():
 
 
 def test_turn_and_take_food_tracking():
+    # slimmed cycle: Inventory only on cycle 0; later cycles are Look-only
     pol = StubPolicy([(Z.ENV_RIGHT, 0), (Z.ENV_TAKE0 + C.FOOD, 0)])
-    cyc = INV_LINE.encode() + b"[ player,,, ]\n"
-    client, _ = mk_client(pol, cyc + b"ok\n" + cyc + b"ok\n")
+    look = b"[ player,,, ]\n"
+    client, _ = mk_client(pol, INV_LINE.encode() + look + b"ok\n" + look + b"ok\n")
     client.cycle()
     assert client.orient == C.EAST     # N -> E (sim rotation convention)
     client.cycle()
     assert client.food_taken == 1
     assert client.protocol_errors == []
+    # life dead-reckoning: synced to food 9 (1134 ticks, post-Inventory by
+    # definition), then -7 Look -7 action per cycle; the Take food ok adds +126
+    assert client.life_est == 9 * 126 - 7 - 7 - 7 - 7 + 126
+    assert client.inv_syncs == 1
+
+
+def test_inventory_period_and_wire_sequence():
+    """Inventory goes out every `inv_every` cycles; in between the perceive
+    is Look-only (the whole point of the slimmed cycle)."""
+    pol = StubPolicy([(Z.ENV_IDLE, 0)] * 4)
+    look = b"[ player,,, ]\n"
+    feed = INV_LINE.encode() + look + look + look + INV_LINE.encode() + look
+    client, srv = mk_client(pol, feed)
+    client.inv_every = 3
+    for _ in range(4):
+        client.cycle()
+    assert client.protocol_errors == []
+    assert client.inv_syncs == 2 and client.cycles == 4
+    sent = srv.recv(4096).decode()
+    assert sent.split("\n")[:-1] == [
+        "Inventory", "Look", "Look", "Look", "Inventory", "Look"]
+
+
+def test_drift_measured_on_sync():
+    """A server food stock that disagrees with the dead-reckoning beyond the
+    126-tick quantization window must show up in max_drift_ticks."""
+    pol = StubPolicy([(Z.ENV_IDLE, 0)] * 2)
+    look = b"[ player,,, ]\n"
+    low_inv = INV_LINE.replace("food 9", "food 2").encode()  # 252 ticks
+    feed = INV_LINE.encode() + look + low_inv + look
+    client, _ = mk_client(pol, feed)
+    client.inv_every = 1               # sync every cycle
+    client.cycle()                     # life_est = 1134 - 7 (Look)
+    client.cycle()                     # server says 252: drift way past 126
+    assert client.protocol_errors == []
+    assert client.max_drift_ticks > 700
+    assert client.life_est == 2 * 126 - 7  # re-anchored, then the Look
+
+
+def test_healthy_dead_reckoning_reports_zero_drift():
+    """The server reports food = ceil(life/126), the TOP of the band — an
+    honestly-charged life_est drifts (-126, 0] below the anchor by the next
+    sync. That phantom band must NOT count as drift (review-pinned), and the
+    first sync never measures (the connect-time default is legitimately
+    stale)."""
+    pol = StubPolicy([(Z.ENV_IDLE, 0)] * 2)
+    look = b"[ player,,, ]\n"
+    inv10 = INV_LINE.replace("food 9", "food 10").encode()
+    client, srv = mk_client(pol, inv10 + look + inv10 + look)
+    client.inv_every = 1
+    client.cycle()   # first sync: anchor only (1260), then Look -7 -> 1253
+    client.cycle()   # second sync: drift -7, inside the healthy band
+    assert client.protocol_errors == []
+    assert client.inv_syncs == 2
+    assert client.max_drift_ticks == 0.0
+
+
+def test_stone_tally_mirrors_sim_inv():
+    pol = StubPolicy([(Z.ENV_TAKE0 + C.LINEMATE, 0), (Z.ENV_TAKE0 + C.SIBUR, 0),
+                      (Z.ENV_SET0 + C.LINEMATE, 0)])
+    look = b"[ player,,, ]\n"
+    feed = INV_LINE.encode() + look + b"ok\n" + look + b"ok\n" + look + b"ok\n"
+    client, srv = mk_client(pol, feed)  # keep the peer referenced: a bare `_`
+    for _i in range(3):                 # would be GC-closed by loop shadowing
+        client.cycle()
+    assert client.protocol_errors == []
+    assert client.stones["linemate"] == 0 and client.stones["sibur"] == 1
+    # the tally (not the cycle-0 server inventory) feeds the obs inv slots
+    inv_slot = 81 * 8 + C.MAX_LEVEL
+    assert pol.seen[2][inv_slot + C.SIBUR] == np.float32(1 * np.float32(0.1))
 
 
 def test_out_of_vocab_broadcast_dropped():
