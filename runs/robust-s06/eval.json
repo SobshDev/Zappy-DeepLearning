@@ -1,0 +1,25 @@
+{
+  "train_sps_median": 95305.02403888995,
+  "stochastic": {
+    "mean_ticks": 6142.576171875,
+    "p10_ticks": 6145.0,
+    "min_ticks": 4079.0,
+    "survival_ge_2000": 1.0,
+    "max_level_mean": 7.90625,
+    "reach_l2_rate": 1.0,
+    "reach_l3_rate": 0.998046875,
+    "t_l3_median": 2222.0,
+    "n": 512
+  },
+  "greedy": {
+    "mean_ticks": 6137.75390625,
+    "p10_ticks": 6144.0,
+    "min_ticks": 3407.0,
+    "survival_ge_2000": 1.0,
+    "max_level_mean": 7.900390625,
+    "reach_l2_rate": 1.0,
+    "reach_l3_rate": 0.99609375,
+    "t_l3_median": 2188.0,
+    "n": 512
+  }
+}
